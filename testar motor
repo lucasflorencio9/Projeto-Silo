@@ -1,0 +1,56 @@
+#define IN1_PIN 26
+#define IN2_PIN 27
+#define ENA_PIN 14
+
+#define PWM_FREQ 5000
+#define PWM_RESOLUTION 8
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(IN1_PIN, INPUT);
+  pinMode(IN2_PIN, INPUT);
+
+  ledcAttach(ENA_PIN, PWM_FREQ, PWM_RESOLUTION);
+
+  Serial.println("CONTROLE MOTOR - CLP OUT3 / OUT4");
+}
+
+void loop() {
+
+  int out3 = digitalRead(IN1_PIN);
+  int out4 = digitalRead(IN2_PIN);
+
+  // OUT3 ligada e OUT4 desligada
+  if (out3 == HIGH && out4 == LOW) {
+
+    digitalWrite(IN1_PIN, HIGH);
+    digitalWrite(IN2_PIN, LOW);
+
+    ledcWrite(ENA_PIN, 255);
+
+    Serial.println("MOTOR: FRENTE");
+  }
+
+  // OUT4 ligada e OUT3 desligada
+  else if (out3 == LOW && out4 == HIGH) {
+
+    digitalWrite(IN1_PIN, LOW);
+    digitalWrite(IN2_PIN, HIGH);
+
+    ledcWrite(ENA_PIN, 255);
+
+    Serial.println("MOTOR: TRAS");
+  }
+
+  // As duas desligadas ou as duas ligadas
+  else {
+
+    ledcWrite(ENA_PIN, 0);
+
+    Serial.println("MOTOR: PARADO");
+  }
+
+  delay(100);
+}
