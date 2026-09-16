@@ -1,0 +1,33 @@
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Serial.println("Teste do sensor ultrassonico");
+}
+
+void loop() {
+  // Envia pulso ultrassônico
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Mede o tempo do retorno
+  long duracao = pulseIn(ECHO_PIN, HIGH);
+
+  // Converte para centímetros
+  float distancia = duracao * 0.0343 / 2;
+
+  Serial.print("Distancia: ");
+  Serial.print(distancia);
+  Serial.println(" cm");
+
+  delay(1000);
+}
