@@ -18,11 +18,7 @@
 // =========================
 // CALIBRAÇÃO DO SILO
 // =========================
-// Distância média medida com o silo vazio
 #define DISTANCIA_VAZIO 20.15
-
-// Distância estimada para o silo cheio
-// Será ajustada futuramente com uma medida real
 #define DISTANCIA_CHEIO 2.0
 
 // =========================
@@ -31,12 +27,7 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-Adafruit_SSD1306 display(
-  SCREEN_WIDTH,
-  SCREEN_HEIGHT,
-  &Wire,
-  -1
-);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // =========================
 // DHT11
@@ -47,7 +38,6 @@ DHT dht(DHT_PIN, DHT_TYPE);
 // MEDIR DISTÂNCIA
 // =========================
 float medirDistancia() {
-
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
 
@@ -58,38 +48,28 @@ float medirDistancia() {
 
   long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
 
-  if (duracao == 0) {
-    return -1;
-  }
+  if (duracao == 0) return -1;
 
-  float distancia = duracao * 0.0343 / 2;
-
-  return distancia;
+  return (duracao * 0.0343 / 2);
 }
 
 // =========================
 // MÉDIA DAS LEITURAS
 // =========================
 float medirDistanciaMedia() {
-
   float soma = 0;
   int leiturasValidas = 0;
 
   for (int i = 0; i < 5; i++) {
-
     float distancia = medirDistancia();
-
     if (distancia > 0) {
       soma += distancia;
       leiturasValidas++;
     }
-
     delay(50);
   }
 
-  if (leiturasValidas == 0) {
-    return -1;
-  }
+  if (leiturasValidas == 0) return -1;
 
   return soma / leiturasValidas;
 }
@@ -98,38 +78,31 @@ float medirDistanciaMedia() {
 // CONFIGURAÇÃO
 // =========================
 void setup() {
-
   Serial.begin(115200);
 
-  // Ultrassônico
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // DHT11
   dht.begin();
 
-  // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-
     Serial.println("Erro ao iniciar OLED!");
-
     while (true);
   }
 
+  // Splash Screen de Inicialização
   display.clearDisplay();
-
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-
-  display.setCursor(0, 0);
-
-  display.println("Monitoramento");
-  display.println("do Silo");
-
+  display.setCursor(15, 20);
+  display.println("SISTEMA DE SILO");
+  display.setCursor(25, 35);
+  display.println("INICIALIZANDO...");
+  display.drawRect(10, 50, 108, 8, SSD1306_WHITE);
+  display.fillRect(12, 52, 50, 4, SSD1306_WHITE);
   display.display();
-
   delay(2000);
 }
 
@@ -137,137 +110,89 @@ void setup() {
 // LOOP
 // =========================
 void loop() {
-
-  // =========================
   // SENSORES
-  // =========================
-
   float distancia = medirDistanciaMedia();
-
   float temperatura = dht.readTemperature();
-
   float umidade = dht.readHumidity();
 
-  // =========================
   // CALCULA NÍVEL
-  // =========================
-
   float nivel = 0;
-
   if (distancia >= 0) {
-
-    nivel =
-      ((DISTANCIA_VAZIO - distancia) /
-      (DISTANCIA_VAZIO - DISTANCIA_CHEIO)) * 100;
-
-    // Limita entre 0 e 100%
-    if (nivel < 0) {
-      nivel = 0;
-    }
-
-    if (nivel > 100) {
-      nivel = 100;
-    }
+    nivel = ((DISTANCIA_VAZIO - distancia) / (DISTANCIA_VAZIO - DISTANCIA_CHEIO)) * 100;
+    if (nivel < 0) nivel = 0;
+    if (nivel > 100) nivel = 100;
   }
 
-  // =========================
   // SERIAL MONITOR
-  // =========================
-
   Serial.println("----------------------");
-
   Serial.print("Distancia: ");
-
-  if (distancia < 0) {
-
-    Serial.println("Erro");
-
-  } else {
-
-    Serial.print(distancia, 2);
-    Serial.println(" cm");
-  }
-
-  Serial.print("Nivel: ");
-  Serial.print(nivel, 1);
-  Serial.println("%");
-
+  if (distancia < 0) Serial.println("Erro");
+  else { Serial.print(distancia, 2); Serial.println(" cm"); }
+  Serial.print("Nivel: "); Serial.print(nivel, 1); Serial.println("%");
   Serial.print("Temperatura: ");
-
-  if (isnan(temperatura)) {
-    Serial.println("Erro");
-  } else {
-
-    Serial.print(temperatura, 1);
-    Serial.println(" C");
-  }
-
+  if (isnan(temperatura)) Serial.println("Erro");
+  else { Serial.print(temperatura, 1); Serial.println(" C"); }
   Serial.print("Umidade: ");
-
-  if (isnan(umidade)) {
-    Serial.println("Erro");
-  } else {
-
-    Serial.print(umidade, 1);
-    Serial.println(" %");
-  }
+  if (isnan(umidade)) Serial.println("Erro");
+  else { Serial.print(umidade, 1); Serial.println(" %"); }
 
   // =========================
-  // OLED
+  // NOVA IHM (OLED REFORMULADO)
   // =========================
-
   display.clearDisplay();
 
+  // 1. Cabeçalho Invertido
+  display.fillRect(0, 0, 128, 13, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
   display.setTextSize(1);
+  display.setCursor(18, 3);
+  display.println("MONITOR DO SILO");
 
-  display.setCursor(0, 0);
+  // Volta texto para cor branca
+  display.setTextColor(SSD1306_WHITE);
 
-  display.println("MONITORAMENTO SILO");
-
-  display.drawLine(
-    0, 12,
-    127, 12,
-    SSD1306_WHITE
-  );
-
-  // Nível
+  // 2. Leitura Principal: Nível em Destaque
   display.setCursor(0, 18);
+  display.println("Nivel:");
 
-  display.print("Nivel: ");
-
-  display.print(nivel, 0);
-
-  display.println("%");
-
-  // Temperatura
-  display.setCursor(0, 32);
-
-  display.print("Temp: ");
-
-  if (isnan(temperatura)) {
-
-    display.println("Erro");
-
+  display.setTextSize(2);
+  display.setCursor(0, 30);
+  if (distancia < 0) {
+    display.println("ERRO");
   } else {
-
-    display.print(temperatura, 1);
-    display.println(" C");
+    display.print((int)nivel);
+    display.println("%");
   }
+
+  // 3. Barra de Progresso do Silo (Vertical na Direita)
+  // Estrutura do Silo (Moldura)
+  display.drawRect(102, 18, 22, 42, SSD1306_WHITE); 
+  
+  // Preenchimento proporcional ao nível
+  int alturaBarra = map((int)nivel, 0, 100, 0, 38);
+  if (alturaBarra > 0) {
+    display.fillRect(104, 58 - alturaBarra, 18, alturaBarra, SSD1306_WHITE);
+  }
+
+  // 4. Rodapé: Temperatura e Umidade
+  display.setTextSize(1);
+  
+  // Linha divisória
+  display.drawLine(0, 48, 96, 48, SSD1306_WHITE);
+
+  // Temp
+  display.setCursor(0, 52);
+  display.print("T:");
+  if (isnan(temperatura)) display.print("--");
+  else display.print(temperatura, 0);
+  display.print("C");
 
   // Umidade
-  display.setCursor(0, 46);
-
-  display.print("Umid: ");
-
-  if (isnan(umidade)) {
-
-    display.println("Erro");
-
-  } else {
-
-    display.print(umidade, 0);
-    display.println(" %");
-  }
+  display.setCursor(50, 52);
+  display.print("U:");
+  if (isnan(umidade)) display.print("--");
+  else display.print(umidade, 0);
+  display.print("%");
 
   display.display();
 
