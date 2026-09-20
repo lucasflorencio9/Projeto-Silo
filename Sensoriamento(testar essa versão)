@@ -1,0 +1,446 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// =====================================================
+// PINOS
+// =====================================================
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+#define DHT_PIN 15
+#define DHT_TYPE DHT11
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+
+
+// =====================================================
+// CALIBRAÇÃO DO SILO
+// =====================================================
+
+// Distância média medida com o silo vazio
+#define DISTANCIA_VAZIO 20.15
+
+// Distância provisória para considerar o silo cheio
+// Será ajustada futuramente com uma medição real
+#define DISTANCIA_CHEIO 2.0
+
+
+// =====================================================
+// OLED
+// =====================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+
+// =====================================================
+// DHT11
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+
+// =====================================================
+// MEDIÇÃO DO SENSOR ULTRASSÔNICO
+// =====================================================
+
+float medirDistancia() {
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duracao == 0) {
+    return -1;
+  }
+
+  float distancia = duracao * 0.0343 / 2;
+
+  return distancia;
+}
+
+
+// =====================================================
+// MÉDIA DAS LEITURAS
+// =====================================================
+
+float medirDistanciaMedia() {
+
+  float soma = 0;
+  int leiturasValidas = 0;
+
+  // Faz 5 leituras para diminuir pequenas oscilações
+  for (int i = 0; i < 5; i++) {
+
+    float distancia = medirDistancia();
+
+    if (distancia > 0) {
+      soma += distancia;
+      leiturasValidas++;
+    }
+
+    delay(50);
+  }
+
+  // Nenhuma leitura válida
+  if (leiturasValidas == 0) {
+    return -1;
+  }
+
+  return soma / leiturasValidas;
+}
+
+
+// =====================================================
+// CONFIGURAÇÃO
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // -------------------------
+  // Sensor ultrassônico
+  // -------------------------
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+
+  // -------------------------
+  // DHT11
+  // -------------------------
+
+  dht.begin();
+
+
+  // -------------------------
+  // OLED
+  // -------------------------
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+
+    Serial.println("Erro ao iniciar OLED!");
+
+    while (true);
+  }
+
+
+  // -------------------------
+  // Tela inicial
+  // -------------------------
+
+  display.clearDisplay();
+
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+
+  display.println("MONITORAMENTO");
+  display.println("DO SILO");
+
+  display.display();
+
+  delay(2000);
+}
+
+
+// =====================================================
+// LOOP PRINCIPAL
+// =====================================================
+
+void loop() {
+
+  // ===================================================
+  // LEITURA DOS SENSORES
+  // ===================================================
+
+  float distancia = medirDistanciaMedia();
+
+  float temperatura = dht.readTemperature();
+
+  float umidade = dht.readHumidity();
+
+
+  // ===================================================
+  // CÁLCULO DO NÍVEL
+  // ===================================================
+
+  float nivel = 0;
+
+  if (distancia >= 0) {
+
+    nivel =
+      ((DISTANCIA_VAZIO - distancia) /
+      (DISTANCIA_VAZIO - DISTANCIA_CHEIO)) * 100;
+
+    // Limita o nível entre 0 e 100%
+    if (nivel < 0) {
+      nivel = 0;
+    }
+
+    if (nivel > 100) {
+      nivel = 100;
+    }
+  }
+
+
+  // ===================================================
+  // SERIAL MONITOR
+  // ===================================================
+
+  Serial.println();
+  Serial.println("------------------------------");
+
+  Serial.print("Distancia: ");
+
+  if (distancia < 0) {
+
+    Serial.println("ERRO");
+
+  } else {
+
+    Serial.print(distancia, 2);
+    Serial.println(" cm");
+  }
+
+
+  Serial.print("Nivel: ");
+  Serial.print(nivel, 1);
+  Serial.println("%");
+
+
+  Serial.print("Temperatura: ");
+
+  if (isnan(temperatura)) {
+
+    Serial.println("ERRO");
+
+  } else {
+
+    Serial.print(temperatura, 1);
+    Serial.println(" C");
+  }
+
+
+  Serial.print("Umidade: ");
+
+  if (isnan(umidade)) {
+
+    Serial.println("ERRO");
+
+  } else {
+
+    Serial.print(umidade, 1);
+    Serial.println(" %");
+  }
+
+
+  // ===================================================
+  // OLED
+  // ===================================================
+
+  display.clearDisplay();
+
+  display.setTextColor(SSD1306_WHITE);
+
+
+  // ===================================================
+  // 1. TÍTULO
+  // ===================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+
+  display.println("MONITORAMENTO SILO");
+
+  display.drawLine(
+    0, 10,
+    127, 10,
+    SSD1306_WHITE
+  );
+
+
+  // ===================================================
+  // 2. NÍVEL EM DESTAQUE
+  // ===================================================
+
+  display.setCursor(0, 16);
+
+  display.setTextSize(1);
+
+  display.println("Nivel:");
+
+
+  display.setTextSize(2);
+
+  display.setCursor(0, 27);
+
+  if (distancia < 0) {
+
+    display.println("ERRO");
+
+  } else {
+
+    display.print((int)nivel);
+    display.println("%");
+  }
+
+
+  // ===================================================
+  // 3. STATUS DO SILO
+  // ===================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(45, 18);
+
+  if (distancia < 0) {
+
+    display.print("ERRO");
+
+  }
+  else if (nivel < 25) {
+
+    display.print("VAZIO");
+
+  }
+  else if (nivel < 75) {
+
+    display.print("NORMAL");
+
+  }
+  else {
+
+    display.print("CHEIO");
+  }
+
+
+  // ===================================================
+  // 4. BARRA VERTICAL DO SILO
+  // =====================================================
+
+  // Moldura do silo
+  display.drawRect(
+    102, 18,
+    22, 42,
+    SSD1306_WHITE
+  );
+
+
+  // Calcula altura proporcional
+  int alturaBarra =
+    (int)(nivel * 38.0 / 100.0);
+
+
+  // Limita a barra entre 0 e 38 pixels
+  if (alturaBarra < 0) {
+    alturaBarra = 0;
+  }
+
+  if (alturaBarra > 38) {
+    alturaBarra = 38;
+  }
+
+
+  // Preenchimento da barra
+  if (alturaBarra > 0) {
+
+    display.fillRect(
+      104,
+      58 - alturaBarra,
+      18,
+      alturaBarra,
+      SSD1306_WHITE
+    );
+  }
+
+
+  // ===================================================
+  // 5. LINHA DIVISÓRIA
+  // ===================================================
+
+  display.drawLine(
+    0, 48,
+    96, 48,
+    SSD1306_WHITE
+  );
+
+
+  // ===================================================
+  // 6. TEMPERATURA
+  // ===================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 52);
+
+  display.print("T:");
+
+  if (isnan(temperatura)) {
+
+    display.print("--");
+
+  } else {
+
+    display.print(temperatura, 0);
+  }
+
+  display.print("C");
+
+
+  // ===================================================
+  // 7. UMIDADE
+  // ===================================================
+
+  display.setCursor(50, 52);
+
+  display.print("U:");
+
+  if (isnan(umidade)) {
+
+    display.print("--");
+
+  } else {
+
+    display.print(umidade, 0);
+  }
+
+  display.print("%");
+
+
+  // ===================================================
+  // ATUALIZA OLED
+  // ===================================================
+
+  display.display();
+
+
+  // ===================================================
+  // INTERVALO ENTRE ATUALIZAÇÕES
+  // ===================================================
+
+  delay(2000);
+}
