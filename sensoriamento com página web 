@@ -1,0 +1,1184 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// =====================================================
+// PINOS
+// =====================================================
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+#define DHT_PIN 15
+#define DHT_TYPE DHT11
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+
+
+// =====================================================
+// CALIBRAÇÃO DO SILO
+// =====================================================
+
+// Distância média medida com o silo vazio
+#define DISTANCIA_VAZIO 20.15
+
+// Distância provisória para considerar o silo cheio
+#define DISTANCIA_CHEIO 2.0
+
+
+// =====================================================
+// REDE WI-FI DO ESP32
+// =====================================================
+
+const char* SSID_AP = "Silo-ESP32";
+const char* SENHA_AP = "12345678";
+
+
+// =====================================================
+// SERVIDOR WEB
+// =====================================================
+
+WebServer server(80);
+
+
+// =====================================================
+// OLED
+// =====================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+
+// =====================================================
+// DHT11
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+
+// =====================================================
+// VARIÁVEIS DOS SENSORES
+// =====================================================
+
+float distancia = -1;
+float nivel = 0;
+float temperatura = NAN;
+float umidade = NAN;
+
+
+// =====================================================
+// CONTROLE DE TEMPO
+// =====================================================
+
+unsigned long ultimoCiclo = 0;
+
+const unsigned long INTERVALO_LEITURA = 2000;
+
+
+// =====================================================
+// MEDIÇÃO DO SENSOR ULTRASSÔNICO
+// =====================================================
+
+float medirDistancia() {
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duracao == 0) {
+    return -1;
+  }
+
+  float distanciaMedida = duracao * 0.0343 / 2;
+
+  return distanciaMedida;
+}
+
+
+// =====================================================
+// MÉDIA DAS LEITURAS
+// =====================================================
+
+float medirDistanciaMedia() {
+
+  float soma = 0;
+
+  int leiturasValidas = 0;
+
+  // Faz 5 leituras
+  for (int i = 0; i < 5; i++) {
+
+    float leitura = medirDistancia();
+
+    if (leitura > 0) {
+
+      soma += leitura;
+
+      leiturasValidas++;
+    }
+
+    delay(50);
+  }
+
+  if (leiturasValidas == 0) {
+
+    return -1;
+  }
+
+  return soma / leiturasValidas;
+}
+
+
+// =====================================================
+// CALCULA O NÍVEL
+// =====================================================
+
+void calcularNivel() {
+
+  if (distancia < 0) {
+
+    nivel = 0;
+
+    return;
+  }
+
+  nivel =
+    ((DISTANCIA_VAZIO - distancia) /
+    (DISTANCIA_VAZIO - DISTANCIA_CHEIO)) * 100;
+
+
+  // Limita entre 0 e 100%
+  if (nivel < 0) {
+    nivel = 0;
+  }
+
+  if (nivel > 100) {
+    nivel = 100;
+  }
+}
+
+
+// =====================================================
+// RETORNA STATUS DO SILO
+// =====================================================
+
+String obterStatus() {
+
+  if (distancia < 0) {
+
+    return "ERRO";
+  }
+
+  if (nivel < 25) {
+
+    return "VAZIO";
+  }
+
+  if (nivel < 75) {
+
+    return "NORMAL";
+  }
+
+  return "CHEIO";
+}
+
+
+// =====================================================
+// ATUALIZA OLED
+// =====================================================
+
+void atualizarOLED() {
+
+  display.clearDisplay();
+
+  display.setTextColor(SSD1306_WHITE);
+
+
+  // ===================================================
+  // 1. TÍTULO
+  // ===================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+
+  display.println("MONITORAMENTO SILO");
+
+  display.drawLine(
+    0, 10,
+    127, 10,
+    SSD1306_WHITE
+  );
+
+
+  // ===================================================
+  // 2. NÍVEL
+  // ===================================================
+
+  display.setCursor(0, 16);
+
+  display.setTextSize(1);
+
+  display.println("Nivel:");
+
+
+  display.setTextSize(2);
+
+  display.setCursor(0, 27);
+
+  if (distancia < 0) {
+
+    display.println("ERRO");
+
+  } else {
+
+    display.print((int)nivel);
+
+    display.println("%");
+  }
+
+
+  // ===================================================
+  // 3. STATUS
+  // ===================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(45, 18);
+
+  display.print(obterStatus());
+
+
+  // ===================================================
+  // 4. BARRA VERTICAL
+  // ===================================================
+
+  display.drawRect(
+    102, 18,
+    22, 42,
+    SSD1306_WHITE
+  );
+
+
+  int alturaBarra =
+    (int)(nivel * 38.0 / 100.0);
+
+
+  if (alturaBarra < 0) {
+    alturaBarra = 0;
+  }
+
+  if (alturaBarra > 38) {
+    alturaBarra = 38;
+  }
+
+
+  if (alturaBarra > 0) {
+
+    display.fillRect(
+      104,
+      58 - alturaBarra,
+      18,
+      alturaBarra,
+      SSD1306_WHITE
+    );
+  }
+
+
+  // ===================================================
+  // 5. LINHA DIVISÓRIA
+  // ===================================================
+
+  display.drawLine(
+    0, 48,
+    96, 48,
+    SSD1306_WHITE
+  );
+
+
+  // ===================================================
+  // 6. TEMPERATURA
+  // ===================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 52);
+
+  display.print("T:");
+
+  if (isnan(temperatura)) {
+
+    display.print("--");
+
+  } else {
+
+    display.print(temperatura, 0);
+  }
+
+  display.print("C");
+
+
+  // ===================================================
+  // 7. UMIDADE
+  // ===================================================
+
+  display.setCursor(50, 52);
+
+  display.print("U:");
+
+  if (isnan(umidade)) {
+
+    display.print("--");
+
+  } else {
+
+    display.print(umidade, 0);
+  }
+
+  display.print("%");
+
+
+  display.display();
+}
+
+
+// =====================================================
+// PÁGINA WEB
+// =====================================================
+
+void handleRoot() {
+
+  String pagina = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html lang="pt-BR">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>Monitoramento do Silo</title>
+
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+
+  margin: 0;
+
+  font-family: Arial, sans-serif;
+
+  background:
+    linear-gradient(135deg, #111827, #1f2937);
+
+  color: white;
+
+  min-height: 100vh;
+
+}
+
+
+header {
+
+  text-align: center;
+
+  padding: 25px 15px 15px;
+
+}
+
+
+header h1 {
+
+  margin: 0;
+
+  font-size: 28px;
+
+}
+
+
+header p {
+
+  margin-top: 8px;
+
+  color: #cbd5e1;
+
+}
+
+
+.container {
+
+  max-width: 900px;
+
+  margin: auto;
+
+  padding: 15px;
+
+}
+
+
+.nivel-card {
+
+  background: #ffffff;
+
+  color: #111827;
+
+  border-radius: 20px;
+
+  padding: 25px;
+
+  text-align: center;
+
+  box-shadow:
+    0 10px 30px rgba(0,0,0,0.25);
+
+}
+
+
+.nivel-titulo {
+
+  font-size: 18px;
+
+  color: #64748b;
+
+}
+
+
+.nivel {
+
+  font-size: 64px;
+
+  font-weight: bold;
+
+  margin: 10px 0;
+
+}
+
+
+.status {
+
+  display: inline-block;
+
+  padding: 8px 20px;
+
+  border-radius: 30px;
+
+  background: #e2e8f0;
+
+  font-weight: bold;
+
+}
+
+
+.barra-container {
+
+  width: 100%;
+
+  height: 25px;
+
+  background: #e5e7eb;
+
+  border-radius: 20px;
+
+  margin-top: 20px;
+
+  overflow: hidden;
+
+}
+
+
+.barra {
+
+  height: 100%;
+
+  width: 0%;
+
+  background: #2563eb;
+
+  border-radius: 20px;
+
+  transition: width 0.5s;
+
+}
+
+
+.grid {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(auto-fit, minmax(180px, 1fr));
+
+  gap: 15px;
+
+  margin-top: 20px;
+
+}
+
+
+.card {
+
+  background: rgba(255,255,255,0.08);
+
+  border: 1px solid rgba(255,255,255,0.12);
+
+  border-radius: 18px;
+
+  padding: 22px;
+
+}
+
+
+.card-titulo {
+
+  color: #cbd5e1;
+
+  font-size: 14px;
+
+}
+
+
+.card-valor {
+
+  font-size: 30px;
+
+  font-weight: bold;
+
+  margin-top: 8px;
+
+}
+
+
+.unidade {
+
+  font-size: 16px;
+
+  color: #94a3b8;
+
+}
+
+
+.info {
+
+  margin-top: 20px;
+
+  background: rgba(255,255,255,0.06);
+
+  padding: 15px;
+
+  border-radius: 15px;
+
+  color: #cbd5e1;
+
+}
+
+
+footer {
+
+  text-align: center;
+
+  padding: 25px;
+
+  color: #94a3b8;
+
+  font-size: 13px;
+
+}
+
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<h1>Monitoramento do Silo</h1>
+
+<p>ESP32 • Sistema de monitoramento</p>
+
+</header>
+
+
+<div class="container">
+
+
+<div class="nivel-card">
+
+<div class="nivel-titulo">
+NÍVEL DO SILO
+</div>
+
+
+<div class="nivel">
+
+<span id="nivel">--</span>%
+
+</div>
+
+
+<div class="status" id="status">
+AGUARDANDO
+</div>
+
+
+<div class="barra-container">
+
+<div class="barra" id="barra">
+</div>
+
+</div>
+
+</div>
+
+
+<div class="grid">
+
+
+<div class="card">
+
+<div class="card-titulo">
+TEMPERATURA
+</div>
+
+<div class="card-valor">
+
+<span id="temperatura">--</span>
+
+<span class="unidade">°C</span>
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="card-titulo">
+UMIDADE
+</div>
+
+<div class="card-valor">
+
+<span id="umidade">--</span>
+
+<span class="unidade">%</span>
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="card-titulo">
+DISTÂNCIA
+</div>
+
+<div class="card-valor">
+
+<span id="distancia">--</span>
+
+<span class="unidade">cm</span>
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<div class="info">
+
+Última atualização:
+<strong id="atualizacao">--</strong>
+
+</div>
+
+
+</div>
+
+
+<footer>
+
+Sistema de Monitoramento de Silo
+<br>
+ESP32 + Sensor Ultrassônico + DHT11
+
+</footer>
+
+
+<script>
+
+async function atualizarDados() {
+
+  try {
+
+    const resposta =
+      await fetch('/dados');
+
+    const dados =
+      await resposta.json();
+
+
+    document.getElementById('nivel')
+      .textContent =
+      dados.nivel;
+
+
+    document.getElementById('status')
+      .textContent =
+      dados.status;
+
+
+    document.getElementById('barra')
+      .style.width =
+      dados.nivel + '%';
+
+
+    document.getElementById('temperatura')
+      .textContent =
+      dados.temperatura;
+
+
+    document.getElementById('umidade')
+      .textContent =
+      dados.umidade;
+
+
+    document.getElementById('distancia')
+      .textContent =
+      dados.distancia;
+
+
+    document.getElementById('atualizacao')
+      .textContent =
+      new Date().toLocaleTimeString();
+
+  }
+
+  catch (erro) {
+
+    console.log(
+      "Erro ao atualizar:",
+      erro
+    );
+
+  }
+
+}
+
+
+// Atualiza imediatamente
+atualizarDados();
+
+
+// Atualiza a cada 1 segundo
+setInterval(
+  atualizarDados,
+  1000
+);
+
+</script>
+
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+  server.send(
+    200,
+    "text/html",
+    pagina
+  );
+}
+
+
+// =====================================================
+// ENVIA DADOS PARA A PÁGINA
+// =====================================================
+
+void handleDados() {
+
+  String json = "{";
+
+  json += "\"nivel\":";
+  json += String(nivel, 1);
+
+  json += ",";
+
+  json += "\"temperatura\":";
+
+  if (isnan(temperatura)) {
+    json += "null";
+  } else {
+    json += String(temperatura, 1);
+  }
+
+  json += ",";
+
+  json += "\"umidade\":";
+
+  if (isnan(umidade)) {
+    json += "null";
+  } else {
+    json += String(umidade, 1);
+  }
+
+  json += ",";
+
+  json += "\"distancia\":";
+
+  if (distancia < 0) {
+    json += "null";
+  } else {
+    json += String(distancia, 2);
+  }
+
+  json += ",";
+
+  json += "\"status\":\"";
+  json += obterStatus();
+  json += "\"";
+
+  json += "}";
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// =====================================================
+// CONFIGURAÇÃO DA REDE
+// =====================================================
+
+void configurarWiFi() {
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+    SSID_AP,
+    SENHA_AP
+  );
+
+
+  Serial.println();
+  Serial.println("==============================");
+
+  Serial.println("REDE WI-FI DO SILO");
+
+  Serial.print("Nome: ");
+  Serial.println(SSID_AP);
+
+  Serial.print("Senha: ");
+  Serial.println(SENHA_AP);
+
+  Serial.print("Endereco: ");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println("==============================");
+}
+
+
+// =====================================================
+// CONFIGURAÇÃO DO SERVIDOR
+// =====================================================
+
+void configurarServidor() {
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+
+  server.on(
+    "/dados",
+    handleDados
+  );
+
+
+  server.begin();
+
+
+  Serial.println(
+    "Servidor web iniciado!"
+  );
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+
+  // -------------------------
+  // Ultrassônico
+  // -------------------------
+
+  pinMode(TRIG_PIN, OUTPUT);
+
+  pinMode(ECHO_PIN, INPUT);
+
+
+  // -------------------------
+  // DHT11
+  // -------------------------
+
+  dht.begin();
+
+
+  // -------------------------
+  // OLED
+  // -------------------------
+
+  Wire.begin(
+    OLED_SDA,
+    OLED_SCL
+  );
+
+
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        0x3C
+      )) {
+
+    Serial.println(
+      "Erro ao iniciar OLED!"
+    );
+
+    while (true);
+  }
+
+
+  // -------------------------
+  // Tela inicial
+  // -------------------------
+
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+
+  display.println(
+    "MONITORAMENTO"
+  );
+
+  display.println(
+    "DO SILO"
+  );
+
+  display.display();
+
+  delay(2000);
+
+
+  // -------------------------
+  // Wi-Fi
+  // -------------------------
+
+  configurarWiFi();
+
+
+  // -------------------------
+  // Servidor
+  // -------------------------
+
+  configurarServidor();
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  // Mantém o servidor funcionando
+  server.handleClient();
+
+
+  // Verifica se já passou o intervalo
+  if (
+    millis() - ultimoCiclo >=
+    INTERVALO_LEITURA
+  ) {
+
+    ultimoCiclo = millis();
+
+
+    // -------------------------
+    // Leitura dos sensores
+    // -------------------------
+
+    distancia =
+      medirDistanciaMedia();
+
+
+    temperatura =
+      dht.readTemperature();
+
+
+    umidade =
+      dht.readHumidity();
+
+
+    // -------------------------
+    // Calcula nível
+    // -------------------------
+
+    calcularNivel();
+
+
+    // -------------------------
+    // Serial
+    // -------------------------
+
+    Serial.println();
+
+    Serial.println(
+      "------------------------------"
+    );
+
+
+    Serial.print(
+      "Distancia: "
+    );
+
+    if (distancia < 0) {
+
+      Serial.println("ERRO");
+
+    } else {
+
+      Serial.print(
+        distancia,
+        2
+      );
+
+      Serial.println(
+        " cm"
+      );
+    }
+
+
+    Serial.print(
+      "Nivel: "
+    );
+
+    Serial.print(
+      nivel,
+      1
+    );
+
+    Serial.println(
+      "%"
+    );
+
+
+    Serial.print(
+      "Status: "
+    );
+
+    Serial.println(
+      obterStatus()
+    );
+
+
+    Serial.print(
+      "Temperatura: "
+    );
+
+    if (isnan(temperatura)) {
+
+      Serial.println(
+        "ERRO"
+      );
+
+    } else {
+
+      Serial.print(
+        temperatura,
+        1
+      );
+
+      Serial.println(
+        " C"
+      );
+    }
+
+
+    Serial.print(
+      "Umidade: "
+    );
+
+    if (isnan(umidade)) {
+
+      Serial.println(
+        "ERRO"
+      );
+
+    } else {
+
+      Serial.print(
+        umidade,
+        1
+      );
+
+      Serial.println(
+        " %"
+      );
+    }
+
+
+    // -------------------------
+    // Atualiza OLED
+    // -------------------------
+
+    atualizarOLED();
+  }
+}
