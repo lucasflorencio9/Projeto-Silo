@@ -1,0 +1,2877 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+// =====================================================
+// MONITORAMENTO DE SILO - ESP32
+// VERSÃO 3 - SUPERVISÓRIO INDUSTRIAL
+// =====================================================
+
+
+// =====================================================
+// PINOS
+// =====================================================
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+#define DHT_PIN 15
+#define DHT_TYPE DHT11
+
+#define OLED_SDA 21
+#define OLED_SCL 22
+
+
+// =====================================================
+// CALIBRAÇÃO DO SILO
+// =====================================================
+//
+// DISTANCIA_VAZIO:
+// distância entre o sensor e o fundo do silo vazio.
+//
+// DISTANCIA_CHEIO:
+// distância correspondente ao silo cheio.
+//
+// IMPORTANTE:
+// Recalibrar depois da instalação definitiva do funil.
+//
+// =====================================================
+
+const float DISTANCIA_VAZIO = 20.15;
+const float DISTANCIA_CHEIO = 2.00;
+
+
+// =====================================================
+// REDE
+// =====================================================
+
+const char* SSID_AP = "Silo-ESP32";
+const char* SENHA_AP = "12345678";
+
+const char* HOSTNAME = "silo";
+
+
+// =====================================================
+// SERVIDOR WEB
+// =====================================================
+
+WebServer server(80);
+
+
+// =====================================================
+// OLED
+// =====================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+
+// =====================================================
+// DHT11
+// =====================================================
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+
+// =====================================================
+// VARIÁVEIS
+// =====================================================
+
+float distancia = -1;
+float nivel = 0;
+
+float temperatura = NAN;
+float umidade = NAN;
+
+
+// =====================================================
+// ESTADO DOS SENSORES
+// =====================================================
+
+bool ultrassonicoOK = false;
+bool dhtOK = false;
+
+
+// =====================================================
+// CONTROLE DE TEMPO
+// =====================================================
+
+unsigned long ultimoUltrassonico = 0;
+unsigned long ultimoDHT = 0;
+unsigned long ultimoOLED = 0;
+
+const unsigned long INTERVALO_ULTRASSONICO = 1000;
+const unsigned long INTERVALO_DHT = 2000;
+const unsigned long INTERVALO_OLED = 1000;
+
+
+// =====================================================
+// STATUS
+// =====================================================
+
+enum StatusSilo {
+
+  STATUS_ERRO,
+
+  STATUS_BAIXO,
+
+  STATUS_NORMAL,
+
+  STATUS_ALTO,
+
+  STATUS_CHEIO
+};
+
+
+StatusSilo statusAtual = STATUS_ERRO;
+
+
+// =====================================================
+// MEDIR DISTÂNCIA
+// =====================================================
+
+float medirDistancia() {
+
+  digitalWrite(
+    TRIG_PIN,
+    LOW
+  );
+
+  delayMicroseconds(2);
+
+
+  digitalWrite(
+    TRIG_PIN,
+    HIGH
+  );
+
+  delayMicroseconds(10);
+
+
+  digitalWrite(
+    TRIG_PIN,
+    LOW
+  );
+
+
+  long duracao =
+    pulseIn(
+      ECHO_PIN,
+      HIGH,
+      30000
+    );
+
+
+  if (duracao == 0) {
+
+    return -1;
+  }
+
+
+  float distanciaMedida =
+    duracao * 0.0343 / 2.0;
+
+
+  return distanciaMedida;
+}
+
+
+// =====================================================
+// MÉDIA DO ULTRASSÔNICO
+// =====================================================
+
+float medirDistanciaMedia() {
+
+  float soma = 0;
+
+  int validas = 0;
+
+
+  for (int i = 0; i < 5; i++) {
+
+    float leitura =
+      medirDistancia();
+
+
+    if (
+      leitura > 0 &&
+      leitura < 400
+    ) {
+
+      soma += leitura;
+
+      validas++;
+    }
+
+
+    delay(20);
+  }
+
+
+  if (validas == 0) {
+
+    return -1;
+  }
+
+
+  return soma / validas;
+}
+
+
+// =====================================================
+// CALCULAR NÍVEL
+// =====================================================
+
+void calcularNivel() {
+
+  if (
+    !ultrassonicoOK ||
+    distancia < 0
+  ) {
+
+    return;
+  }
+
+
+  nivel =
+    (
+      (DISTANCIA_VAZIO - distancia) /
+      (DISTANCIA_VAZIO - DISTANCIA_CHEIO)
+    ) * 100.0;
+
+
+  if (nivel < 0) {
+
+    nivel = 0;
+  }
+
+
+  if (nivel > 100) {
+
+    nivel = 100;
+  }
+}
+
+
+// =====================================================
+// ATUALIZAR STATUS
+// =====================================================
+
+void atualizarStatus() {
+
+  if (!ultrassonicoOK) {
+
+    statusAtual = STATUS_ERRO;
+
+    return;
+  }
+
+
+  switch (statusAtual) {
+
+
+    case STATUS_ERRO:
+
+      if (nivel < 25) {
+
+        statusAtual = STATUS_BAIXO;
+
+      } else if (nivel < 75) {
+
+        statusAtual = STATUS_NORMAL;
+
+      } else if (nivel < 90) {
+
+        statusAtual = STATUS_ALTO;
+
+      } else {
+
+        statusAtual = STATUS_CHEIO;
+      }
+
+      break;
+
+
+    case STATUS_BAIXO:
+
+      if (nivel >= 27) {
+
+        if (nivel < 75) {
+
+          statusAtual = STATUS_NORMAL;
+
+        } else if (nivel < 90) {
+
+          statusAtual = STATUS_ALTO;
+
+        } else {
+
+          statusAtual = STATUS_CHEIO;
+        }
+      }
+
+      break;
+
+
+    case STATUS_NORMAL:
+
+      if (nivel < 23) {
+
+        statusAtual = STATUS_BAIXO;
+
+      } else if (nivel >= 77) {
+
+        if (nivel < 90) {
+
+          statusAtual = STATUS_ALTO;
+
+        } else {
+
+          statusAtual = STATUS_CHEIO;
+        }
+      }
+
+      break;
+
+
+    case STATUS_ALTO:
+
+      if (nivel < 73) {
+
+        if (nivel < 23) {
+
+          statusAtual = STATUS_BAIXO;
+
+        } else {
+
+          statusAtual = STATUS_NORMAL;
+        }
+
+      } else if (nivel >= 92) {
+
+        statusAtual = STATUS_CHEIO;
+      }
+
+      break;
+
+
+    case STATUS_CHEIO:
+
+      if (nivel < 88) {
+
+        if (nivel < 73) {
+
+          if (nivel < 23) {
+
+            statusAtual = STATUS_BAIXO;
+
+          } else {
+
+            statusAtual = STATUS_NORMAL;
+          }
+
+        } else {
+
+          statusAtual = STATUS_ALTO;
+        }
+      }
+
+      break;
+  }
+}
+
+
+// =====================================================
+// TEXTO DO STATUS
+// =====================================================
+
+String obterStatus() {
+
+  switch (statusAtual) {
+
+    case STATUS_BAIXO:
+      return "BAIXO";
+
+    case STATUS_NORMAL:
+      return "NORMAL";
+
+    case STATUS_ALTO:
+      return "ALTO";
+
+    case STATUS_CHEIO:
+      return "CHEIO";
+
+    default:
+      return "ERRO SENSOR";
+  }
+}
+
+
+// =====================================================
+// LEITURA ULTRASSÔNICO
+// =====================================================
+
+void atualizarUltrassonico() {
+
+  float novaDistancia =
+    medirDistanciaMedia();
+
+
+  if (novaDistancia > 0) {
+
+    distancia =
+      novaDistancia;
+
+    ultrassonicoOK =
+      true;
+
+    calcularNivel();
+
+    atualizarStatus();
+
+  } else {
+
+    ultrassonicoOK =
+      false;
+
+    statusAtual =
+      STATUS_ERRO;
+
+    // Mantém o último nível válido.
+  }
+}
+
+
+// =====================================================
+// LEITURA DHT11
+// =====================================================
+
+void atualizarDHT() {
+
+  float novaTemperatura =
+    dht.readTemperature();
+
+
+  float novaUmidade =
+    dht.readHumidity();
+
+
+  if (
+    !isnan(novaTemperatura) &&
+    !isnan(novaUmidade)
+  ) {
+
+    temperatura =
+      novaTemperatura;
+
+    umidade =
+      novaUmidade;
+
+    dhtOK =
+      true;
+
+  } else {
+
+    dhtOK =
+      false;
+
+    // Mantém os últimos valores válidos.
+  }
+}
+
+
+// =====================================================
+// UPTIME
+// =====================================================
+
+String obterUptime() {
+
+  unsigned long segundos =
+    millis() / 1000;
+
+
+  unsigned long dias =
+    segundos / 86400;
+
+  segundos %= 86400;
+
+
+  unsigned long horas =
+    segundos / 3600;
+
+  segundos %= 3600;
+
+
+  unsigned long minutos =
+    segundos / 60;
+
+  segundos %= 60;
+
+
+  char buffer[40];
+
+
+  sprintf(
+    buffer,
+    "%lu d %02lu:%02lu:%02lu",
+    dias,
+    horas,
+    minutos,
+    segundos
+  );
+
+
+  return String(buffer);
+}
+
+
+// =====================================================
+// OLED
+// =====================================================
+
+void atualizarOLED() {
+
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+
+  // TÍTULO
+
+  display.setTextSize(1);
+
+  display.setCursor(
+    20,
+    0
+  );
+
+  display.println(
+    "MONITORAMENTO SILO"
+  );
+
+
+  display.drawLine(
+    0,
+    10,
+    127,
+    10,
+    SSD1306_WHITE
+  );
+
+
+  // NÍVEL
+
+  display.setCursor(
+    0,
+    15
+  );
+
+  display.println(
+    "NIVEL"
+  );
+
+
+  display.setTextSize(2);
+
+  display.setCursor(
+    0,
+    26
+  );
+
+
+  if (!ultrassonicoOK) {
+
+    display.println(
+      "ERRO"
+    );
+
+  } else {
+
+    display.print(
+      (int)nivel
+    );
+
+    display.println(
+      "%"
+    );
+  }
+
+
+  // STATUS
+
+  display.setTextSize(1);
+
+  display.setCursor(
+    55,
+    17
+  );
+
+  display.println(
+    obterStatus()
+  );
+
+
+  // BARRA
+
+  display.drawRect(
+    55,
+    30,
+    42,
+    11,
+    SSD1306_WHITE
+  );
+
+
+  if (ultrassonicoOK) {
+
+    int largura =
+      (int)(
+        nivel * 38.0 / 100.0
+      );
+
+
+    if (largura > 38) {
+
+      largura = 38;
+    }
+
+
+    if (largura > 0) {
+
+      display.fillRect(
+        57,
+        32,
+        largura,
+        7,
+        SSD1306_WHITE
+      );
+    }
+  }
+
+
+  display.drawLine(
+    0,
+    45,
+    127,
+    45,
+    SSD1306_WHITE
+  );
+
+
+  // TEMPERATURA
+
+  display.setCursor(
+    0,
+    51
+  );
+
+  display.print(
+    "T:"
+  );
+
+
+  if (dhtOK) {
+
+    display.print(
+      temperatura,
+      0
+    );
+
+    display.print(
+      "C"
+    );
+
+  } else {
+
+    display.print(
+      "ERR"
+    );
+  }
+
+
+  // UMIDADE
+
+  display.setCursor(
+    55,
+    51
+  );
+
+  display.print(
+    "U:"
+  );
+
+
+  if (dhtOK) {
+
+    display.print(
+      umidade,
+      0
+    );
+
+    display.print(
+      "%"
+    );
+
+  } else {
+
+    display.print(
+      "ERR"
+    );
+  }
+
+
+  display.display();
+}
+
+
+// =====================================================
+// PÁGINA WEB - SUPERVISÓRIO
+// =====================================================
+
+void handleRoot() {
+
+  String pagina = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html lang="pt-BR">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>Supervisório - Silo</title>
+
+
+<style>
+
+/* ===================================================
+   RESET
+   =================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+
+body {
+
+  margin: 0;
+
+  font-family:
+    Arial,
+    Helvetica,
+    sans-serif;
+
+  background:
+    #0b1120;
+
+  color: #e5e7eb;
+}
+
+
+/* ===================================================
+   CABEÇALHO
+   =================================================== */
+
+.header {
+
+  height: 72px;
+
+  background:
+    #111827;
+
+  border-bottom:
+    1px solid #263244;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content:
+    space-between;
+
+  padding:
+    0 28px;
+}
+
+
+.logo {
+
+  display: flex;
+
+  align-items: center;
+
+  gap: 12px;
+}
+
+
+.logo-icon {
+
+  width: 38px;
+
+  height: 38px;
+
+  border-radius: 8px;
+
+  background:
+    #2563eb;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: center;
+
+  font-weight: bold;
+
+  font-size: 18px;
+}
+
+
+.logo-title {
+
+  font-size: 18px;
+
+  font-weight: bold;
+}
+
+
+.logo-subtitle {
+
+  font-size: 11px;
+
+  color: #64748b;
+
+  margin-top: 2px;
+}
+
+
+.connection {
+
+  display: flex;
+
+  align-items: center;
+
+  gap: 8px;
+
+  background:
+    #052e1b;
+
+  border:
+    1px solid #166534;
+
+  border-radius: 20px;
+
+  padding:
+    7px 14px;
+
+  font-size: 12px;
+
+  color: #86efac;
+}
+
+
+.connection-dot {
+
+  width: 8px;
+
+  height: 8px;
+
+  background:
+    #22c55e;
+
+  border-radius: 50%;
+
+  box-shadow:
+    0 0 8px #22c55e;
+}
+
+
+/* ===================================================
+   CONTAINER
+   =================================================== */
+
+.container {
+
+  max-width: 1250px;
+
+  margin:
+    0 auto;
+
+  padding:
+    24px;
+}
+
+
+/* ===================================================
+   GRID PRINCIPAL
+   =================================================== */
+
+.main-grid {
+
+  display: grid;
+
+  grid-template-columns:
+    1.25fr 1fr;
+
+  gap: 20px;
+}
+
+
+/* ===================================================
+   PAINEL
+   =================================================== */
+
+.panel {
+
+  background:
+    #111827;
+
+  border:
+    1px solid #263244;
+
+  border-radius: 12px;
+
+  overflow: hidden;
+}
+
+
+.panel-header {
+
+  padding:
+    15px 18px;
+
+  border-bottom:
+    1px solid #263244;
+
+  display: flex;
+
+  justify-content:
+    space-between;
+
+  align-items: center;
+}
+
+
+.panel-title {
+
+  font-size: 13px;
+
+  font-weight: bold;
+
+  letter-spacing:
+    0.5px;
+
+  color:
+    #cbd5e1;
+}
+
+
+.panel-tag {
+
+  font-size: 10px;
+
+  color:
+    #64748b;
+
+  background:
+    #1f2937;
+
+  padding:
+    4px 8px;
+
+  border-radius: 4px;
+}
+
+
+/* ===================================================
+   ÁREA DO SILO
+   =================================================== */
+
+.silo-area {
+
+  min-height: 500px;
+
+  display: flex;
+
+  align-items: center;
+
+  justify-content: center;
+
+  padding: 30px;
+}
+
+
+.silo-wrapper {
+
+  position: relative;
+
+  display: flex;
+
+  align-items: center;
+
+  gap: 22px;
+}
+
+
+/* ===================================================
+   ESCALA
+   =================================================== */
+
+.scale {
+
+  height: 350px;
+
+  width: 45px;
+
+  position: relative;
+
+  display: flex;
+
+  flex-direction: column;
+
+  justify-content:
+    space-between;
+
+  font-size: 10px;
+
+  color: #64748b;
+
+  text-align: right;
+}
+
+
+.scale-line {
+
+  position: absolute;
+
+  right: 0;
+
+  top: 0;
+
+  bottom: 0;
+
+  width: 1px;
+
+  background:
+    #334155;
+}
+
+
+.scale-label {
+
+  padding-right: 8px;
+}
+
+
+/* ===================================================
+   SILO
+   =================================================== */
+
+.silo {
+
+  width: 230px;
+
+  height: 350px;
+
+  position: relative;
+
+  border:
+    3px solid #64748b;
+
+  border-radius:
+    115px 115px 35px 35px;
+
+  background:
+    #0f172a;
+
+  overflow: hidden;
+
+  box-shadow:
+    inset 0 0 30px
+    rgba(0,0,0,0.5);
+}
+
+
+/* teto */
+
+.silo-roof {
+
+  position: absolute;
+
+  top: -25px;
+
+  left: 32px;
+
+  width: 160px;
+
+  height: 50px;
+
+  border:
+    3px solid #64748b;
+
+  border-radius:
+    50%;
+
+  background:
+    #1e293b;
+
+  z-index: 5;
+}
+
+
+/* cone inferior */
+
+.silo-bottom {
+
+  position: absolute;
+
+  bottom: -42px;
+
+  left: 43px;
+
+  width: 140px;
+
+  height: 85px;
+
+  background:
+    #1e293b;
+
+  border-left:
+    3px solid #64748b;
+
+  border-right:
+    3px solid #64748b;
+
+  transform:
+    perspective(80px)
+    rotateX(-15deg);
+
+  z-index: 5;
+}
+
+
+/* material */
+
+.material {
+
+  position: absolute;
+
+  bottom: 0;
+
+  left: 0;
+
+  width: 100%;
+
+  height:
+    0%;
+
+  background:
+    linear-gradient(
+      180deg,
+      #d97706,
+      #92400e
+    );
+
+  transition:
+    height 0.8s ease;
+
+  z-index: 2;
+
+  box-shadow:
+    inset 0 8px 15px
+    rgba(255,255,255,0.08);
+}
+
+
+/* efeito superfície */
+
+.material-top {
+
+  position: absolute;
+
+  top: -7px;
+
+  left: -3%;
+
+  width: 106%;
+
+  height: 15px;
+
+  border-radius: 50%;
+
+  background:
+    #f59e0b;
+
+  opacity: 0.9;
+}
+
+
+/* linhas do silo */
+
+.silo-line {
+
+  position: absolute;
+
+  left: 0;
+
+  width: 100%;
+
+  height: 1px;
+
+  background:
+    rgba(255,255,255,0.08);
+
+  z-index: 4;
+}
+
+
+.line1 {
+  top: 25%;
+}
+
+
+.line2 {
+  top: 50%;
+}
+
+
+.line3 {
+  top: 75%;
+}
+
+
+/* ===================================================
+   VALOR DO NÍVEL
+   =================================================== */
+
+.level-display {
+
+  text-align: center;
+
+  margin-top: 20px;
+}
+
+
+.level-number {
+
+  font-size: 48px;
+
+  font-weight:
+    bold;
+
+  color:
+    #f8fafc;
+}
+
+
+.level-unit {
+
+  font-size: 18px;
+
+  color:
+    #64748b;
+}
+
+
+.status-badge {
+
+  display:
+    inline-block;
+
+  margin-top: 8px;
+
+  padding:
+    7px 18px;
+
+  border-radius:
+    5px;
+
+  background:
+    #1e293b;
+
+  border:
+    1px solid #334155;
+
+  font-size:
+    12px;
+
+  font-weight:
+    bold;
+}
+
+
+/* ===================================================
+   PAINEL DE DADOS
+   =================================================== */
+
+.data-grid {
+
+  display: grid;
+
+  grid-template-columns:
+    repeat(2, 1fr);
+
+  gap: 12px;
+
+  padding: 18px;
+}
+
+
+.data-card {
+
+  background:
+    #0f172a;
+
+  border:
+    1px solid #263244;
+
+  border-radius:
+    8px;
+
+  padding:
+    18px;
+}
+
+
+.data-label {
+
+  color:
+    #64748b;
+
+  font-size:
+    11px;
+
+  text-transform:
+    uppercase;
+}
+
+
+.data-value {
+
+  font-size:
+    27px;
+
+  font-weight:
+    bold;
+
+  margin-top:
+    7px;
+
+  color:
+    #f8fafc;
+}
+
+
+.data-unit {
+
+  font-size:
+    12px;
+
+  color:
+    #64748b;
+}
+
+
+/* ===================================================
+   STATUS DOS SENSORES
+   =================================================== */
+
+.sensor-panel {
+
+  margin:
+    0 18px 18px;
+
+  border:
+    1px solid #263244;
+
+  border-radius:
+    8px;
+
+  overflow: hidden;
+}
+
+
+.sensor-row {
+
+  display:
+    flex;
+
+  justify-content:
+    space-between;
+
+  padding:
+    12px 14px;
+
+  background:
+    #0f172a;
+
+  border-bottom:
+    1px solid #1e293b;
+
+  font-size:
+    12px;
+}
+
+
+.sensor-row:last-child {
+
+  border-bottom:
+    none;
+}
+
+
+.sensor-ok {
+
+  color:
+    #4ade80;
+
+  font-weight:
+    bold;
+}
+
+
+.sensor-error {
+
+  color:
+    #f87171;
+
+  font-weight:
+    bold;
+}
+
+
+/* ===================================================
+   INFORMAÇÕES
+   =================================================== */
+
+.info-grid {
+
+  display:
+    grid;
+
+  grid-template-columns:
+    repeat(2, 1fr);
+
+  gap:
+    1px;
+
+  background:
+    #263244;
+
+  margin-top:
+    20px;
+}
+
+
+.info-item {
+
+  background:
+    #111827;
+
+  padding:
+    16px;
+}
+
+
+.info-label {
+
+  font-size:
+    10px;
+
+  color:
+    #64748b;
+
+  text-transform:
+    uppercase;
+}
+
+
+.info-value {
+
+  font-size:
+    13px;
+
+  color:
+    #cbd5e1;
+
+  margin-top:
+    5px;
+}
+
+
+/* ===================================================
+   RODAPÉ
+   =================================================== */
+
+.footer {
+
+  text-align:
+    center;
+
+  padding:
+    25px;
+
+  color:
+    #475569;
+
+  font-size:
+    10px;
+}
+
+
+/* ===================================================
+   RESPONSIVO
+   =================================================== */
+
+@media (max-width: 850px) {
+
+  .main-grid {
+
+    grid-template-columns:
+      1fr;
+  }
+
+
+  .silo-area {
+
+    min-height:
+      450px;
+  }
+}
+
+
+@media (max-width: 500px) {
+
+  .header {
+
+    padding:
+      0 14px;
+  }
+
+
+  .logo-subtitle {
+
+    display:
+      none;
+  }
+
+
+  .container {
+
+    padding:
+      12px;
+  }
+
+
+  .silo {
+
+    width:
+      190px;
+
+    height:
+      300px;
+  }
+
+
+  .scale {
+
+    height:
+      300px;
+  }
+
+
+  .silo-roof {
+
+    left:
+      25px;
+
+    width:
+      135px;
+  }
+
+
+  .data-grid {
+
+    grid-template-columns:
+      1fr 1fr;
+
+    padding:
+      12px;
+  }
+
+
+  .level-number {
+
+    font-size:
+      40px;
+  }
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<!-- =================================================
+     CABEÇALHO
+     ================================================= -->
+
+<header class="header">
+
+<div class="logo">
+
+<div class="logo-icon">
+S
+</div>
+
+<div>
+
+<div class="logo-title">
+SUPERVISÓRIO DO SILO
+</div>
+
+<div class="logo-subtitle">
+ESP32 • MONITORAMENTO EM TEMPO REAL
+</div>
+
+</div>
+
+</div>
+
+
+<div class="connection">
+
+<span class="connection-dot">
+</span>
+
+ESP32 ONLINE
+
+</div>
+
+</header>
+
+
+<!-- =================================================
+     CONTEÚDO
+     ================================================= -->
+
+<main class="container">
+
+
+<div class="main-grid">
+
+
+<!-- =================================================
+     SILO
+     ================================================= -->
+
+<section class="panel">
+
+
+<div class="panel-header">
+
+<span class="panel-title">
+NÍVEL DO SILO
+</span>
+
+<span class="panel-tag">
+LIVE
+</span>
+
+</div>
+
+
+<div class="silo-area">
+
+
+<div>
+
+
+<div class="silo-wrapper">
+
+
+<!-- ESCALA -->
+
+<div class="scale">
+
+<div class="scale-line">
+</div>
+
+<div class="scale-label">
+100%
+</div>
+
+<div class="scale-label">
+75%
+</div>
+
+<div class="scale-label">
+50%
+</div>
+
+<div class="scale-label">
+25%
+</div>
+
+<div class="scale-label">
+0%
+</div>
+
+</div>
+
+
+<!-- SILO -->
+
+<div class="silo">
+
+
+<div class="silo-roof">
+</div>
+
+
+<div class="material"
+id="material">
+
+<div class="material-top">
+</div>
+
+</div>
+
+
+<div class="silo-line line1">
+</div>
+
+<div class="silo-line line2">
+</div>
+
+<div class="silo-line line3">
+</div>
+
+
+<div class="silo-bottom">
+</div>
+
+
+</div>
+
+</div>
+
+
+<!-- NÚMERO -->
+
+<div class="level-display">
+
+<span
+class="level-number"
+id="nivel">
+
+--
+
+</span>
+
+<span class="level-unit">
+%
+</span>
+
+
+<br>
+
+
+<span
+class="status-badge"
+id="status">
+
+AGUARDANDO
+
+</span>
+
+</div>
+
+
+</div>
+
+</div>
+
+</section>
+
+
+<!-- =================================================
+     DADOS
+     ================================================= -->
+
+<section class="panel">
+
+
+<div class="panel-header">
+
+<span class="panel-title">
+VARIÁVEIS DE PROCESSO
+</span>
+
+<span class="panel-tag">
+SENSORES
+</span>
+
+</div>
+
+
+<div class="data-grid">
+
+
+<div class="data-card">
+
+<div class="data-label">
+Temperatura
+</div>
+
+<div class="data-value">
+
+<span id="temperatura">
+--
+</span>
+
+<span class="data-unit">
+°C
+</span>
+
+</div>
+
+</div>
+
+
+<div class="data-card">
+
+<div class="data-label">
+Umidade
+</div>
+
+<div class="data-value">
+
+<span id="umidade">
+--
+</span>
+
+<span class="data-unit">
+%
+</span>
+
+</div>
+
+</div>
+
+
+<div class="data-card">
+
+<div class="data-label">
+Distância
+</div>
+
+<div class="data-value">
+
+<span id="distancia">
+--
+</span>
+
+<span class="data-unit">
+cm
+</span>
+
+</div>
+
+</div>
+
+
+<div class="data-card">
+
+<div class="data-label">
+Nível
+</div>
+
+<div class="data-value">
+
+<span id="nivelCard">
+--
+</span>
+
+<span class="data-unit">
+%
+</span>
+
+</div>
+
+</div>
+
+</div>
+
+
+<!-- =================================================
+     SENSORES
+     ================================================= -->
+
+<div class="sensor-panel">
+
+
+<div class="sensor-row">
+
+<span>
+Sensor ultrassônico
+</span>
+
+<span
+id="ultrassonico"
+class="sensor-error">
+
+--
+
+</span>
+
+</div>
+
+
+<div class="sensor-row">
+
+<span>
+Sensor DHT11
+</span>
+
+<span
+id="dht"
+class="sensor-error">
+
+--
+
+</span>
+
+</div>
+
+
+</div>
+
+
+<!-- =================================================
+     INFORMAÇÕES
+     ================================================= -->
+
+<div class="info-grid">
+
+
+<div class="info-item">
+
+<div class="info-label">
+Última atualização
+</div>
+
+<div
+class="info-value"
+id="atualizacao">
+
+--
+
+</div>
+
+</div>
+
+
+<div class="info-item">
+
+<div class="info-label">
+Sistema ligado
+</div>
+
+<div
+class="info-value"
+id="uptime">
+
+--
+
+</div>
+
+</div>
+
+
+<div class="info-item">
+
+<div class="info-label">
+Endereço principal
+</div>
+
+<div class="info-value">
+silo.local
+</div>
+
+</div>
+
+
+<div class="info-item">
+
+<div class="info-label">
+IP alternativo
+</div>
+
+<div class="info-value">
+192.168.4.1
+</div>
+
+</div>
+
+
+</div>
+
+
+</section>
+
+
+</div>
+
+
+</main>
+
+
+<footer class="footer">
+
+SISTEMA DE MONITORAMENTO DE SILO
+<br>
+ESP32 • HC-SR04 • DHT11 • OLED
+
+</footer>
+
+
+<!-- =================================================
+     JAVASCRIPT
+     ================================================= -->
+
+<script>
+
+
+async function atualizarDados() {
+
+
+  try {
+
+
+    const resposta =
+      await fetch(
+        '/dados'
+      );
+
+
+    const dados =
+      await resposta.json();
+
+
+    // ================================================
+    // NÍVEL
+    // ================================================
+
+
+    const nivel =
+      document.getElementById(
+        'nivel'
+      );
+
+
+    const nivelCard =
+      document.getElementById(
+        'nivelCard'
+      );
+
+
+    const material =
+      document.getElementById(
+        'material'
+      );
+
+
+    const status =
+      document.getElementById(
+        'status'
+      );
+
+
+    if (
+      dados.sensorUltrassonico
+    ) {
+
+
+      nivel.textContent =
+        Math.round(
+          dados.nivel
+        );
+
+
+      nivelCard.textContent =
+        Math.round(
+          dados.nivel
+        );
+
+
+      material.style.height =
+        dados.nivel + '%';
+
+
+      status.textContent =
+        dados.status;
+
+
+    } else {
+
+
+      nivel.textContent =
+        'ERRO';
+
+
+      nivelCard.textContent =
+        'ERRO';
+
+
+      material.style.height =
+        '0%';
+
+
+      status.textContent =
+        'ERRO SENSOR';
+
+    }
+
+
+    // ================================================
+    // TEMPERATURA
+    // ================================================
+
+
+    if (
+      dados.temperatura === null
+    ) {
+
+      document.getElementById(
+        'temperatura'
+      ).textContent =
+        '--';
+
+    } else {
+
+      document.getElementById(
+        'temperatura'
+      ).textContent =
+        dados.temperatura;
+    }
+
+
+    // ================================================
+    // UMIDADE
+    // ================================================
+
+
+    if (
+      dados.umidade === null
+    ) {
+
+      document.getElementById(
+        'umidade'
+      ).textContent =
+        '--';
+
+    } else {
+
+      document.getElementById(
+        'umidade'
+      ).textContent =
+        dados.umidade;
+    }
+
+
+    // ================================================
+    // DISTÂNCIA
+    // ================================================
+
+
+    if (
+      dados.distancia === null
+    ) {
+
+      document.getElementById(
+        'distancia'
+      ).textContent =
+        '--';
+
+    } else {
+
+      document.getElementById(
+        'distancia'
+      ).textContent =
+        dados.distancia;
+    }
+
+
+    // ================================================
+    // ULTRASSÔNICO
+    // ================================================
+
+
+    const ultra =
+      document.getElementById(
+        'ultrassonico'
+      );
+
+
+    if (
+      dados.sensorUltrassonico
+    ) {
+
+      ultra.textContent =
+        '✓ OK';
+
+      ultra.className =
+        'sensor-ok';
+
+    } else {
+
+      ultra.textContent =
+        '✕ ERRO';
+
+      ultra.className =
+        'sensor-error';
+    }
+
+
+    // ================================================
+    // DHT
+    // ================================================
+
+
+    const dht =
+      document.getElementById(
+        'dht'
+      );
+
+
+    if (
+      dados.sensorDHT
+    ) {
+
+      dht.textContent =
+        '✓ OK';
+
+      dht.className =
+        'sensor-ok';
+
+    } else {
+
+      dht.textContent =
+        '✕ ERRO';
+
+      dht.className =
+        'sensor-error';
+    }
+
+
+    // ================================================
+    // HORÁRIO
+    // ================================================
+
+
+    document.getElementById(
+      'atualizacao'
+    ).textContent =
+      new Date()
+        .toLocaleTimeString();
+
+
+    // ================================================
+    // UPTIME
+    // ================================================
+
+
+    document.getElementById(
+      'uptime'
+    ).textContent =
+      dados.uptime;
+
+
+  }
+
+
+  catch (erro) {
+
+
+    console.log(
+      'Erro de comunicação:',
+      erro
+    );
+
+
+  }
+
+}
+
+
+// Primeira atualização
+
+atualizarDados();
+
+
+// Atualiza a interface a cada segundo
+
+setInterval(
+  atualizarDados,
+  1000
+);
+
+
+</script>
+
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+  server.send(
+    200,
+    "text/html",
+    pagina
+  );
+}
+
+
+// =====================================================
+// API DE DADOS
+// =====================================================
+
+void handleDados() {
+
+  String json = "{";
+
+
+  // NÍVEL
+
+  json += "\"nivel\":";
+  json += String(
+    nivel,
+    1
+  );
+
+
+  // TEMPERATURA
+
+  json += ",";
+  json += "\"temperatura\":";
+
+
+  if (dhtOK) {
+
+    json += String(
+      temperatura,
+      1
+    );
+
+  } else {
+
+    json += "null";
+  }
+
+
+  // UMIDADE
+
+  json += ",";
+  json += "\"umidade\":";
+
+
+  if (dhtOK) {
+
+    json += String(
+      umidade,
+      1
+    );
+
+  } else {
+
+    json += "null";
+  }
+
+
+  // DISTÂNCIA
+
+  json += ",";
+  json += "\"distancia\":";
+
+
+  if (ultrassonicoOK) {
+
+    json += String(
+      distancia,
+      2
+    );
+
+  } else {
+
+    json += "null";
+  }
+
+
+  // STATUS
+
+  json += ",";
+  json += "\"status\":\"";
+
+  json += obterStatus();
+
+  json += "\"";
+
+
+  // SENSOR ULTRASSÔNICO
+
+  json += ",";
+  json += "\"sensorUltrassonico\":";
+
+  json +=
+    ultrassonicoOK
+    ? "true"
+    : "false";
+
+
+  // SENSOR DHT
+
+  json += ",";
+  json += "\"sensorDHT\":";
+
+  json +=
+    dhtOK
+    ? "true"
+    : "false";
+
+
+  // UPTIME
+
+  json += ",";
+  json += "\"uptime\":\"";
+
+  json += obterUptime();
+
+  json += "\"";
+
+
+  json += "}";
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// =====================================================
+// WI-FI
+// =====================================================
+
+void configurarWiFi() {
+
+  WiFi.mode(
+    WIFI_AP
+  );
+
+
+  WiFi.softAP(
+    SSID_AP,
+    SENHA_AP
+  );
+
+
+  Serial.println();
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "      SUPERVISORIO DO SILO"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  Serial.print(
+    "Wi-Fi: "
+  );
+
+  Serial.println(
+    SSID_AP
+  );
+
+
+  Serial.print(
+    "Senha: "
+  );
+
+  Serial.println(
+    SENHA_AP
+  );
+
+
+  Serial.print(
+    "IP: "
+  );
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+
+  // ===================================================
+  // mDNS
+  // ===================================================
+
+  if (
+    MDNS.begin(
+      HOSTNAME
+    )
+  ) {
+
+    Serial.println(
+      "mDNS: OK"
+    );
+
+
+    Serial.print(
+      "Acesso: http://"
+    );
+
+    Serial.print(
+      HOSTNAME
+    );
+
+    Serial.println(
+      ".local"
+    );
+
+  } else {
+
+    Serial.println(
+      "mDNS: ERRO"
+    );
+  }
+
+
+  Serial.println(
+    "================================"
+  );
+}
+
+
+// =====================================================
+// SERVIDOR
+// =====================================================
+
+void configurarServidor() {
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+
+  server.on(
+    "/dados",
+    handleDados
+  );
+
+
+  server.begin();
+
+
+  Serial.println(
+    "Servidor HTTP: OK"
+  );
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+
+  Serial.begin(
+    115200
+  );
+
+
+  // ===================================================
+  // ULTRASSÔNICO
+  // ===================================================
+
+  pinMode(
+    TRIG_PIN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    ECHO_PIN,
+    INPUT
+  );
+
+
+  // ===================================================
+  // DHT
+  // ===================================================
+
+  dht.begin();
+
+
+  // ===================================================
+  // OLED
+  // ===================================================
+
+  Wire.begin(
+    OLED_SDA,
+    OLED_SCL
+  );
+
+
+  if (
+    !display.begin(
+      SSD1306_SWITCHCAPVCC,
+      0x3C
+    )
+  ) {
+
+    Serial.println(
+      "Erro ao iniciar OLED!"
+    );
+
+
+    while (true);
+  }
+
+
+  // ===================================================
+  // TELA INICIAL
+  // ===================================================
+
+  display.clearDisplay();
+
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+
+  display.setTextSize(1);
+
+
+  display.setCursor(
+    20,
+    0
+  );
+
+
+  display.println(
+    "MONITORAMENTO"
+  );
+
+
+  display.setCursor(
+    35,
+    12
+  );
+
+
+  display.println(
+    "DO SILO"
+  );
+
+
+  display.setCursor(
+    0,
+    30
+  );
+
+
+  display.println(
+    "Wi-Fi:"
+  );
+
+
+  display.println(
+    "Silo-ESP32"
+  );
+
+
+  display.setCursor(
+    0,
+    50
+  );
+
+
+  display.println(
+    "silo.local"
+  );
+
+
+  display.display();
+
+
+  delay(3000);
+
+
+  // ===================================================
+  // WI-FI
+  // ===================================================
+
+  configurarWiFi();
+
+
+  // ===================================================
+  // SERVIDOR
+  // ===================================================
+
+  configurarServidor();
+
+
+  // ===================================================
+  // PRIMEIRAS LEITURAS
+  // ===================================================
+
+  atualizarUltrassonico();
+
+  atualizarDHT();
+
+  atualizarOLED();
+
+
+  Serial.println();
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    " SISTEMA PRONTO"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "Acesso principal:"
+  );
+
+  Serial.println(
+    "http://silo.local"
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "Acesso alternativo:"
+  );
+
+  Serial.println(
+    "http://192.168.4.1"
+  );
+
+  Serial.println(
+    "================================"
+  );
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+
+  // ===================================================
+  // SERVIDOR
+  // ===================================================
+
+  server.handleClient();
+
+
+  unsigned long agora =
+    millis();
+
+
+  // ===================================================
+  // ULTRASSÔNICO - 1 SEGUNDO
+  // ===================================================
+
+  if (
+    agora - ultimoUltrassonico >=
+    INTERVALO_ULTRASSONICO
+  ) {
+
+    ultimoUltrassonico =
+      agora;
+
+
+    atualizarUltrassonico();
+  }
+
+
+  // ===================================================
+  // DHT11 - 2 SEGUNDOS
+  // ===================================================
+
+  if (
+    agora - ultimoDHT >=
+    INTERVALO_DHT
+  ) {
+
+    ultimoDHT =
+      agora;
+
+
+    atualizarDHT();
+  }
+
+
+  // ===================================================
+  // OLED - 1 SEGUNDO
+  // ===================================================
+
+  if (
+    agora - ultimoOLED >=
+    INTERVALO_OLED
+  ) {
+
+    ultimoOLED =
+      agora;
+
+
+    atualizarOLED();
+  }
+}
+
