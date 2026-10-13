@@ -1,0 +1,41 @@
+#include <ESP32Servo.h>
+
+// Pino do ESP32 onde o fio amarelo do servo está conectado
+const int servoPin = 18; 
+
+Servo meuServo;
+
+// Ângulos de calibração para o trilho
+const int anguloFechado = 0;   // Gaveta totalmente enfiada (fechada)
+const int anguloAberto   = 90;  // Gaveta puxada para fora (aberta)
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("Iniciando teste do Dispenser com Trilhos...");
+
+  // Configuração obrigatória de timers para o ESP32 Servo
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  meuServo.setPeriodHertz(50); // Frequência padrão para servos (50Hz)
+  meuServo.attach(servoPin, 500, 2400); // Associa o servo ao Pino 18
+
+  // Posiciona inicialmente fechado
+  meuServo.write(anguloFechado);
+  delay(1000);
+}
+
+void loop() {
+  Serial.println("Abrindo a comporta (Trilho avança)...");
+  meuServo.write(anguloAberto);
+  delay(2000); // Fica aberto por 2 segundos
+
+  Serial.println("Fechando a comporta (Trilho recua)...");
+  meuServo.write(anguloFechado);
+  delay(3000); // Fica fechado por 3 segundos
+}
+
