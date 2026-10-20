@@ -1,0 +1,898 @@
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ESP32Servo.h>
+#include <math.h>
+
+// ==================================================
+// CONFIGURACOES DO SISTEMA
+// ==================================================
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define DHT_PIN 15
+#define DHT_TYPE DHT11
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define SERVO_PIN 19
+
+const float DISTANCIA_VAZIO = 20.15;
+const float DISTANCIA_CHEIO = 2.00;
+
+const int ANGULO_FECHADO = 20;
+const int ANGULO_ABERTO = 110;
+
+const char* SSID_AP = "Silo-ESP32";
+const char* SENHA_AP = "12345678";
+const char* HOSTNAME = "silo";
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+DHT dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+Servo servoComporta;
+
+// ==================================================
+// VARIAVEIS
+// ==================================================
+
+float distancia = -1;
+float nivel = 0;
+float temperatura = NAN;
+float umidade = NAN;
+
+bool ultrassonicoOK = false;
+bool dhtOK = false;
+bool comportaAberta = false;
+
+enum StatusSilo {
+  STATUS_ERRO,
+  STATUS_BAIXO,
+  STATUS_NORMAL,
+  STATUS_ALTO,
+  STATUS_CHEIO
+};
+
+StatusSilo statusAtual = STATUS_ERRO;
+
+unsigned long ultimoUltrassonico = 0;
+unsigned long ultimoDHT = 0;
+unsigned long ultimoOLED = 0;
+unsigned long ultimaGravacaoHistorico = 0;
+
+const unsigned long INTERVALO_ULTRASSONICO = 1000;
+const unsigned long INTERVALO_DHT = 2000;
+const unsigned long INTERVALO_OLED = 1000;
+const unsigned long INTERVALO_HISTORICO = 5000;
+
+struct RegistroHistorico {
+  unsigned long tempo;
+  float nivel;
+  float temperatura;
+  float umidade;
+  bool nivelOK;
+  bool dhtValido;
+};
+
+const int MAX_REGISTROS = 360;
+RegistroHistorico historico[MAX_REGISTROS];
+
+int totalRegistros = 0;
+int indiceHistorico = 0;
+
+// ==================================================
+// SENSOR ULTRASSONICO
+// ==================================================
+
+float medirDistancia() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duracao == 0) return -1;
+
+  return duracao * 0.0343 / 2.0;
+}
+
+float medirDistanciaMedia() {
+  float soma = 0;
+  int validas = 0;
+
+  for (int i = 0; i < 5; i++) {
+    float leitura = medirDistancia();
+
+    if (leitura > 0 && leitura < 400) {
+      soma += leitura;
+      validas++;
+    }
+
+    delay(20);
+  }
+
+  if (validas == 0) return -1;
+
+  return soma / validas;
+}
+
+void calcularNivel() {
+  if (!ultrassonicoOK || distancia < 0) return;
+
+  nivel = ((DISTANCIA_VAZIO - distancia) /
+          (DISTANCIA_VAZIO - DISTANCIA_CHEIO)) * 100.0;
+
+  nivel = constrain(nivel, 0, 100);
+}
+
+void atualizarStatus() {
+  if (!ultrassonicoOK) {
+    statusAtual = STATUS_ERRO;
+    return;
+  }
+
+  switch (statusAtual) {
+    case STATUS_ERRO:
+      if (nivel < 25) statusAtual = STATUS_BAIXO;
+      else if (nivel < 75) statusAtual = STATUS_NORMAL;
+      else if (nivel < 90) statusAtual = STATUS_ALTO;
+      else statusAtual = STATUS_CHEIO;
+      break;
+
+    case STATUS_BAIXO:
+      if (nivel >= 27) {
+        if (nivel < 75) statusAtual = STATUS_NORMAL;
+        else if (nivel < 90) statusAtual = STATUS_ALTO;
+        else statusAtual = STATUS_CHEIO;
+      }
+      break;
+
+    case STATUS_NORMAL:
+      if (nivel < 23) statusAtual = STATUS_BAIXO;
+      else if (nivel >= 77) {
+        if (nivel < 90) statusAtual = STATUS_ALTO;
+        else statusAtual = STATUS_CHEIO;
+      }
+      break;
+
+    case STATUS_ALTO:
+      if (nivel < 73) {
+        if (nivel < 23) statusAtual = STATUS_BAIXO;
+        else statusAtual = STATUS_NORMAL;
+      } else if (nivel >= 92) {
+        statusAtual = STATUS_CHEIO;
+      }
+      break;
+
+    case STATUS_CHEIO:
+      if (nivel < 88) {
+        if (nivel < 73) {
+          if (nivel < 23) statusAtual = STATUS_BAIXO;
+          else statusAtual = STATUS_NORMAL;
+        } else {
+          statusAtual = STATUS_ALTO;
+        }
+      }
+      break;
+  }
+}
+
+String obterStatus() {
+  switch (statusAtual) {
+    case STATUS_BAIXO: return "BAIXO";
+    case STATUS_NORMAL: return "NORMAL";
+    case STATUS_ALTO: return "ALTO";
+    case STATUS_CHEIO: return "CHEIO";
+    default: return "ERRO SENSOR";
+  }
+}
+
+void atualizarUltrassonico() {
+  float novaDistancia = medirDistanciaMedia();
+
+  if (novaDistancia > 0) {
+    distancia = novaDistancia;
+    ultrassonicoOK = true;
+    calcularNivel();
+    atualizarStatus();
+  } else {
+    ultrassonicoOK = false;
+    statusAtual = STATUS_ERRO;
+  }
+}
+
+// ==================================================
+// SENSOR DHT11
+// ==================================================
+
+void atualizarDHT() {
+  float t = dht.readTemperature();
+  float u = dht.readHumidity();
+
+  if (!isnan(t) && !isnan(u)) {
+    temperatura = t;
+    umidade = u;
+    dhtOK = true;
+  } else {
+    dhtOK = false;
+  }
+}
+
+// ==================================================
+// TEMPO DE FUNCIONAMENTO
+// ==================================================
+
+String obterUptime() {
+  unsigned long s = millis() / 1000UL;
+  unsigned long dias = s / 86400UL;
+  s %= 86400UL;
+
+  unsigned long horas = s / 3600UL;
+  s %= 3600UL;
+
+  unsigned long minutos = s / 60UL;
+  s %= 60UL;
+
+  char buffer[40];
+
+  snprintf(buffer, sizeof(buffer),
+    "%lu d %02lu:%02lu:%02lu",
+    dias, horas, minutos, s);
+
+  return String(buffer);
+}
+
+// ==================================================
+// HISTORICO DOS GRAFICOS
+// ==================================================
+
+void registrarHistorico() {
+  unsigned long agora = millis();
+
+  if (totalRegistros > 0 &&
+      agora - ultimaGravacaoHistorico < INTERVALO_HISTORICO) {
+    return;
+  }
+
+  ultimaGravacaoHistorico = agora;
+
+  RegistroHistorico &r = historico[indiceHistorico];
+
+  r.tempo = agora / 1000UL;
+  r.nivel = nivel;
+  r.temperatura = temperatura;
+  r.umidade = umidade;
+  r.nivelOK = ultrassonicoOK;
+  r.dhtValido = dhtOK;
+
+  indiceHistorico = (indiceHistorico + 1) % MAX_REGISTROS;
+
+  if (totalRegistros < MAX_REGISTROS) {
+    totalRegistros++;
+  }
+}
+
+// ==================================================
+// OLED
+// ==================================================
+
+void atualizarOLED() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(20, 0);
+  display.println("MONITORAMENTO SILO");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  display.setCursor(0, 15);
+  display.println("NIVEL");
+
+  display.setTextSize(2);
+  display.setCursor(0, 26);
+
+  if (ultrassonicoOK) {
+    display.print((int)nivel);
+    display.println("%");
+  } else {
+    display.println("ERRO");
+  }
+
+  display.setTextSize(1);
+  display.setCursor(55, 17);
+  display.println(obterStatus());
+
+  display.drawRect(55, 30, 42, 11, SSD1306_WHITE);
+
+  if (ultrassonicoOK) {
+    int largura = (int)(nivel * 38.0 / 100.0);
+    largura = constrain(largura, 0, 38);
+
+    if (largura > 0) {
+      display.fillRect(57, 32, largura, 7, SSD1306_WHITE);
+    }
+  }
+
+  display.drawLine(0, 45, 127, 45, SSD1306_WHITE);
+
+  display.setCursor(0, 51);
+  display.print("T:");
+
+  if (dhtOK) {
+    display.print(temperatura, 0);
+    display.print("C");
+  } else {
+    display.print("ERR");
+  }
+
+  display.setCursor(55, 51);
+  display.print("U:");
+
+  if (dhtOK) {
+    display.print(umidade, 0);
+    display.print("%");
+  } else {
+    display.print("ERR");
+  }
+
+  display.display();
+}
+
+// ==================================================
+// PAGINA HOME
+// ==================================================
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Silo - Home</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
+header{background:#111827;padding:16px 22px;display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+nav{display:flex;gap:7px;flex-wrap:wrap}
+nav a{color:#cbd5e1;text-decoration:none;padding:10px;
+border:1px solid #334155;border-radius:7px;font-size:13px}
+nav a.active,nav a:hover{background:#1d4ed8;color:white}
+main{max-width:1050px;margin:auto;padding:18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden}
+.ph{padding:15px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.body{padding:18px}
+.silo{width:150px;height:215px;margin:8px auto 16px;
+border:3px solid #64748b;border-radius:70px 70px 18px 18px;
+position:relative;overflow:hidden;background:#0f172a}
+.material{position:absolute;bottom:0;width:100%;height:0%;
+background:linear-gradient(#f59e0b,#92400e);transition:height .5s}
+.level{text-align:center;font-size:30px;font-weight:bold}
+.status{text-align:center;padding:8px;color:#93c5fd}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.metric{padding:14px;background:#0f172a;border:1px solid #263244;border-radius:8px}
+.label{font-size:11px;color:#94a3b8}
+.value{font-size:24px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere}
+.rows{font-size:13px;margin-top:16px}
+.rows div{padding:11px 0;border-bottom:1px solid #263244}
+.ok{color:#4ade80}.err{color:#f87171}
+footer{text-align:center;padding:20px;color:#64748b;font-size:11px}
+@media(max-width:680px){.grid{grid-template-columns:1fr}main{padding:12px}}
+</style></head><body>
+<header>
+<div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">MONITORAMENTO EM TEMPO REAL</div></div>
+<nav>
+<a class="active" href="http://silo.local/">Home</a>
+<a href="http://silo.local/graficos">Gráficos</a>
+<a href="http://silo.local/comporta">Comporta</a>
+</nav>
+</header>
+<main><div class="grid">
+<section class="panel"><div class="ph">NÍVEL DO SILO</div><div class="body">
+<div class="silo"><div class="material" id="material"></div></div>
+<div class="level"><span id="nivel">--</span>%</div>
+<div class="status" id="status">AGUARDANDO</div>
+</div></section>
+<section class="panel"><div class="ph">VARIÁVEIS DE PROCESSO</div><div class="body">
+<div class="metrics">
+<div class="metric"><div class="label">Temperatura</div><div class="value"><span id="temp">--</span> °C</div></div>
+<div class="metric"><div class="label">Umidade</div><div class="value"><span id="umid">--</span> %</div></div>
+<div class="metric"><div class="label">Distância</div><div class="value"><span id="dist">--</span> cm</div></div>
+<div class="metric"><div class="label">Funcionamento</div><div class="value" style="font-size:14px" id="uptime">--</div></div>
+</div>
+<div class="rows">
+<div>Ultrassônico: <b id="ultra">--</b></div>
+<div>DHT11: <b id="dht">--</b></div>
+<div>Comporta: <b id="gate">--</b></div>
+</div>
+</div></section>
+</div></main>
+<footer>SISTEMA DE MONITORAMENTO DE SILO • ESP32</footer>
+<script>
+async function atualizar(){
+try{
+let r=await fetch('/dados',{cache:'no-store'});
+let d=await r.json();
+document.getElementById('nivel').textContent=d.sensorUltrassonico?Math.round(d.nivel):'ERRO';
+document.getElementById('material').style.height=d.sensorUltrassonico?d.nivel+'%':'0%';
+document.getElementById('status').textContent=d.status;
+document.getElementById('temp').textContent=d.temperatura===null?'--':Number(d.temperatura).toFixed(1);
+document.getElementById('umid').textContent=d.umidade===null?'--':Number(d.umidade).toFixed(1);
+document.getElementById('dist').textContent=d.distancia===null?'--':Number(d.distancia).toFixed(2);
+document.getElementById('uptime').textContent=d.uptime;
+let u=document.getElementById('ultra');
+u.textContent=d.sensorUltrassonico?'OK':'ERRO';u.className=d.sensorUltrassonico?'ok':'err';
+let h=document.getElementById('dht');
+h.textContent=d.sensorDHT?'OK':'ERRO';h.className=d.sensorDHT?'ok':'err';
+document.getElementById('gate').textContent=d.comportaAberta?'ABERTA':'FECHADA';
+}catch(e){console.log(e)}
+}
+atualizar();setInterval(atualizar,1500);
+</script></body></html>
+)rawliteral";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ==================================================
+// PAGINA GRAFICOS
+// ==================================================
+
+void handleGraficos() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Silo - Gráficos</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
+header{background:#111827;padding:16px 22px;display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+nav{display:flex;gap:7px;flex-wrap:wrap}
+nav a{color:#cbd5e1;text-decoration:none;padding:10px;
+border:1px solid #334155;border-radius:7px;font-size:13px}
+nav a.active,nav a:hover{background:#1d4ed8;color:white}
+main{max-width:1050px;margin:auto;padding:18px}
+.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden;margin-bottom:16px}
+.ph{padding:15px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.chart{padding:12px}
+canvas{display:block;width:100%;height:220px}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.metric{background:#111827;border:1px solid #263244;border-radius:8px;padding:15px}
+.label{font-size:11px;color:#94a3b8}.value{font-size:22px;margin-top:8px;font-weight:bold}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+button{background:#1f2937;color:white;border:1px solid #334155;border-radius:7px;padding:10px;cursor:pointer}
+button.active{background:#1d4ed8}
+.note{font-size:11px;color:#64748b;padding:0 4px 12px}
+@media(max-width:600px){main{padding:12px}.metrics{grid-template-columns:1fr}}
+</style></head><body>
+<header><div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">HISTÓRICO DO PROCESSO</div></div>
+<nav>
+<a href="http://silo.local/">Home</a>
+<a class="active" href="http://silo.local/graficos">Gráficos</a>
+<a href="http://silo.local/comporta">Comporta</a>
+</nav></header>
+<main>
+<div class="filters">
+<button class="active" data-period="300">5 minutos</button>
+<button data-period="900">15 minutos</button>
+<button data-period="1800">30 minutos</button>
+</div>
+<div class="metrics">
+<div class="metric"><div class="label">Nível atual</div><div class="value" id="nv">--</div></div>
+<div class="metric"><div class="label">Temperatura</div><div class="value" id="tp">--</div></div>
+<div class="metric"><div class="label">Umidade</div><div class="value" id="um">--</div></div>
+</div>
+<section class="panel"><div class="ph">NÍVEL DO SILO (%)</div><div class="chart"><canvas id="cNivel"></canvas></div></section>
+<section class="panel"><div class="ph">TEMPERATURA (°C)</div><div class="chart"><canvas id="cTemp"></canvas></div></section>
+<section class="panel"><div class="ph">UMIDADE (%)</div><div class="chart"><canvas id="cUmid"></canvas></div></section>
+<div class="note" id="nota">Histórico temporário armazenado na memória da ESP32.</div>
+</main>
+<script>
+let periodo=300,hist=[];
+document.querySelectorAll('[data-period]').forEach(b=>{
+b.onclick=()=>{
+document.querySelectorAll('[data-period]').forEach(x=>x.classList.remove('active'));
+b.classList.add('active');periodo=Number(b.dataset.period);desenharTodos();
+};
+});
+function grafico(id,chave,cor,minFixo,maxFixo){
+const c=document.getElementById(id),rect=c.getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+c.width=Math.max(1,rect.width*ratio);c.height=Math.max(1,rect.height*ratio);
+const ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);
+const w=rect.width,h=rect.height,m={l:42,r:12,t:15,b:28},pw=w-m.l-m.r,ph=h-m.t-m.b;
+ctx.clearRect(0,0,w,h);
+const agora=hist.length?hist[hist.length-1].tempo:0;
+const dados=hist.filter(d=>d.tempo>=agora-periodo&&d[chave]!==null&&Number.isFinite(d[chave]));
+let ymin=minFixo,ymax=maxFixo;
+if(ymin===null||ymax===null){
+if(dados.length){let v=dados.map(d=>d[chave]),lo=Math.min(...v),hi=Math.max(...v),f=Math.max((hi-lo)*.2,1);ymin=Math.floor(lo-f);ymax=Math.ceil(hi+f);}
+else{ymin=0;ymax=10;}
+}
+ctx.font='11px Arial';ctx.strokeStyle='#263244';ctx.fillStyle='#94a3b8';
+for(let i=0;i<=4;i++){
+let y=m.t+ph*i/4;ctx.beginPath();ctx.moveTo(m.l,y);ctx.lineTo(w-m.r,y);ctx.stroke();
+ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText((ymax-(ymax-ymin)*i/4).toFixed(1),m.l-6,y);
+}
+if(!dados.length){ctx.textAlign='center';ctx.fillText('Aguardando dados...',w/2,h/2);return;}
+ctx.strokeStyle=cor;ctx.lineWidth=2.5;ctx.beginPath();
+dados.forEach((d,i)=>{
+let x=m.l+Math.max(0,Math.min(1,(d.tempo-(agora-periodo))/periodo))*pw;
+let y=m.t+(ymax-d[chave])/(ymax-ymin)*ph;
+if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+});
+ctx.stroke();
+}
+function desenharTodos(){
+grafico('cNivel','nivel','#f59e0b',0,100);
+grafico('cTemp','temperatura','#fb7185',null,null);
+grafico('cUmid','umidade','#38bdf8',0,100);
+let agora=hist.length?hist[hist.length-1].tempo:0;
+let vis=hist.filter(d=>d.tempo>=agora-periodo);
+document.getElementById('nota').textContent=vis.length+' amostras no período. Máximo de 30 minutos.';
+}
+async function atualizar(){
+try{
+let r=await fetch('/historico',{cache:'no-store'});hist=await r.json();
+let n=hist.filter(d=>d.nivel!==null),t=hist.filter(d=>d.temperatura!==null),u=hist.filter(d=>d.umidade!==null);
+document.getElementById('nv').textContent=n.length?Number(n[n.length-1].nivel).toFixed(1)+'%':'--';
+document.getElementById('tp').textContent=t.length?Number(t[t.length-1].temperatura).toFixed(1)+' °C':'--';
+document.getElementById('um').textContent=u.length?Number(u[u.length-1].umidade).toFixed(1)+'%':'--';
+desenharTodos();
+}catch(e){console.log(e)}
+}
+window.addEventListener('resize',desenharTodos);
+atualizar();setInterval(atualizar,5000);
+</script></body></html>
+)rawliteral";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ==================================================
+// PAGINA COMPORTA
+// ==================================================
+
+void handleComporta() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Silo - Comporta</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
+header{background:#111827;padding:16px 22px;display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+nav{display:flex;gap:7px;flex-wrap:wrap}
+nav a{color:#cbd5e1;text-decoration:none;padding:10px;
+border:1px solid #334155;border-radius:7px;font-size:13px}
+nav a.active,nav a:hover{background:#1d4ed8;color:white}
+main{max-width:600px;margin:auto;padding:18px}
+.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden}
+.ph{padding:16px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.content{padding:22px}
+p{font-size:13px;color:#94a3b8;line-height:1.6}
+.gate{width:120px;height:120px;margin:24px auto;border:3px solid #475569;
+border-radius:18px;background:#0f172a;display:flex;align-items:center;
+justify-content:center;font-size:48px}
+.status{padding:14px;border-radius:8px;text-align:center;font-weight:bold;
+background:#172554;color:#93c5fd;margin:20px 0}
+.status.open{background:#422006;color:#fbbf24}
+button{width:100%;padding:16px;border:0;border-radius:8px;
+font-weight:bold;font-size:14px;margin-top:10px;cursor:pointer}
+button:disabled{opacity:.5}
+.open{background:#15803d;color:white}.close{background:#334155;color:white}
+#mensagem{text-align:center;min-height:20px}
+.note{font-size:11px;color:#64748b}
+@media(max-width:600px){main{padding:12px}}
+</style></head><body>
+<header><div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">CONTROLE DA COMPORTA</div></div>
+<nav>
+<a href="http://silo.local/">Home</a>
+<a href="http://silo.local/graficos">Gráficos</a>
+<a class="active" href="http://silo.local/comporta">Comporta</a>
+</nav></header>
+<main><section class="panel"><div class="ph">CONTROLE DA COMPORTA</div>
+<div class="content">
+<p>Utilize os botões para abrir ou fechar a comporta acionada pelo servo MG996R.</p>
+<div class="gate" id="icone">▤</div>
+<div class="status" id="estado">CONSULTANDO...</div>
+<button class="open" id="btnAbrir" onclick="acionar('/abrir')">ABRIR COMPORTA</button>
+<button class="close" id="btnFechar" onclick="acionar('/fechar')">FECHAR COMPORTA</button>
+<p id="mensagem" aria-live="polite"></p>
+<p class="note">O estado mostrado corresponde ao último comando enviado. Sem um sensor de posição, não há confirmação física da abertura ou do fechamento.</p>
+</div></section></main>
+<script>
+const estadoEl=document.getElementById('estado');
+const mensagemEl=document.getElementById('mensagem');
+const iconeEl=document.getElementById('icone');
+const botoes=[document.getElementById('btnAbrir'),document.getElementById('btnFechar')];
+function mostrarEstado(aberta){
+estadoEl.textContent=aberta?'COMPORTA ABERTA':'COMPORTA FECHADA';
+estadoEl.className=aberta?'status open':'status';
+iconeEl.textContent=aberta?'▱':'▤';
+}
+async function consultar(){
+try{let r=await fetch('/estadoComporta',{cache:'no-store'});if(!r.ok)throw Error();let d=await r.json();mostrarEstado(d.aberta);}
+catch(e){estadoEl.textContent='SEM COMUNICAÇÃO';}
+}
+async function acionar(url){
+botoes.forEach(b=>b.disabled=true);mensagemEl.textContent='Enviando comando...';
+try{
+let r=await fetch(url,{method:'POST'});let d=await r.json();if(!r.ok)throw Error();
+mostrarEstado(d.aberta);mensagemEl.textContent=d.mensagem;
+}catch(e){mensagemEl.textContent='Falha de comunicação com a ESP32.';}
+finally{botoes.forEach(b=>b.disabled=false);}
+}
+consultar();
+</script></body></html>
+)rawliteral";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ==================================================
+// CONTROLE DA COMPORTA
+// ==================================================
+
+void handleAbrirComporta() {
+  servoComporta.write(ANGULO_ABERTO);
+  comportaAberta = true;
+
+  server.send(200, "application/json",
+    "{\"aberta\":true,\"mensagem\":\"Comando de abertura enviado.\"}");
+}
+
+void handleFecharComporta() {
+  servoComporta.write(ANGULO_FECHADO);
+  comportaAberta = false;
+
+  server.send(200, "application/json",
+    "{\"aberta\":false,\"mensagem\":\"Comando de fechamento enviado.\"}");
+}
+
+void handleEstadoComporta() {
+  String json = "{\"aberta\":";
+  json += comportaAberta ? "true" : "false";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ==================================================
+// API DE DADOS ATUAIS
+// ==================================================
+
+void handleDados() {
+  String json = "{";
+
+  json += "\"nivel\":";
+  json += String(nivel, 1);
+
+  json += ",\"temperatura\":";
+  json += dhtOK ? String(temperatura, 1) : "null";
+
+  json += ",\"umidade\":";
+  json += dhtOK ? String(umidade, 1) : "null";
+
+  json += ",\"distancia\":";
+  json += ultrassonicoOK ? String(distancia, 2) : "null";
+
+  json += ",\"status\":\"";
+  json += obterStatus();
+  json += "\"";
+
+  json += ",\"sensorUltrassonico\":";
+  json += ultrassonicoOK ? "true" : "false";
+
+  json += ",\"sensorDHT\":";
+  json += dhtOK ? "true" : "false";
+
+  json += ",\"comportaAberta\":";
+  json += comportaAberta ? "true" : "false";
+
+  json += ",\"uptime\":\"";
+  json += obterUptime();
+  json += "\"}";
+
+  server.send(200, "application/json", json);
+}
+
+// ==================================================
+// API DO HISTORICO
+// ==================================================
+
+void handleHistorico() {
+  String json;
+  json.reserve(18000);
+  json = "[";
+
+  int inicio = (indiceHistorico - totalRegistros + MAX_REGISTROS)
+               % MAX_REGISTROS;
+
+  for (int i = 0; i < totalRegistros; i++) {
+    int pos = (inicio + i) % MAX_REGISTROS;
+    RegistroHistorico &r = historico[pos];
+
+    if (i > 0) json += ",";
+
+    json += "{\"tempo\":";
+    json += String(r.tempo);
+
+    json += ",\"nivel\":";
+    json += r.nivelOK ? String(r.nivel, 1) : "null";
+
+    json += ",\"temperatura\":";
+    json += r.dhtValido ? String(r.temperatura, 1) : "null";
+
+    json += ",\"umidade\":";
+    json += r.dhtValido ? String(r.umidade, 1) : "null";
+
+    json += "}";
+  }
+
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+// ==================================================
+// WIFI E MDNS
+// ==================================================
+
+void configurarWiFi() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(SSID_AP, SENHA_AP);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("    MONITORAMENTO DO SILO");
+  Serial.println("================================");
+  Serial.print("Rede Wi-Fi: ");
+  Serial.println(SSID_AP);
+  Serial.print("Senha: ");
+  Serial.println(SENHA_AP);
+  Serial.print("IP local: ");
+  Serial.println(WiFi.softAPIP());
+
+  if (MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS iniciado com sucesso.");
+    Serial.println("Endereco principal: http://silo.local");
+  } else {
+    Serial.println("Falha ao iniciar mDNS.");
+  }
+}
+
+// ==================================================
+// CONFIGURAR ROTAS DO SERVIDOR
+// ==================================================
+
+void configurarServidor() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/graficos", HTTP_GET, handleGraficos);
+  server.on("/comporta", HTTP_GET, handleComporta);
+
+  server.on("/dados", HTTP_GET, handleDados);
+  server.on("/historico", HTTP_GET, handleHistorico);
+
+  server.on("/abrir", HTTP_POST, handleAbrirComporta);
+  server.on("/fechar", HTTP_POST, handleFecharComporta);
+  server.on("/estadoComporta", HTTP_GET, handleEstadoComporta);
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain; charset=utf-8",
+                "Pagina nao encontrada. Acesse http://silo.local");
+  });
+
+  server.begin();
+  Serial.println("Servidor HTTP iniciado.");
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);
+
+  dht.begin();
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Erro ao iniciar OLED!");
+    while (true) {
+      delay(100);
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(20, 0);
+  display.println("MONITORAMENTO");
+  display.setCursor(35, 12);
+  display.println("DO SILO");
+  display.setCursor(0, 30);
+  display.println("Wi-Fi:");
+  display.println("Silo-ESP32");
+  display.setCursor(0, 50);
+  display.println("silo.local");
+  display.display();
+
+  // Inicializar servo na posicao fechada
+  servoComporta.setPeriodHertz(50);
+  servoComporta.attach(SERVO_PIN, 500, 2400);
+  servoComporta.write(ANGULO_FECHADO);
+  comportaAberta = false;
+
+  delay(1000);
+
+  // Iniciar rede, mDNS e servidor
+  configurarWiFi();
+  configurarServidor();
+
+  // Primeiras leituras
+  atualizarUltrassonico();
+  atualizarDHT();
+  atualizarOLED();
+  registrarHistorico();
+
+  unsigned long agora = millis();
+  ultimoUltrassonico = agora;
+  ultimoDHT = agora;
+  ultimoOLED = agora;
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       SISTEMA PRONTO");
+  Serial.println("================================");
+  Serial.println("HOME:      http://silo.local/");
+  Serial.println("GRAFICOS:  http://silo.local/graficos");
+  Serial.println("COMPORTA:  http://silo.local/comporta");
+  Serial.println("================================");
+}
+
+// ==================================================
+// LOOP PRINCIPAL
+// ==================================================
+
+void loop() {
+  server.handleClient();
+
+  unsigned long agora = millis();
+
+  if (agora - ultimoUltrassonico >= INTERVALO_ULTRASSONICO) {
+    ultimoUltrassonico = agora;
+    atualizarUltrassonico();
+  }
+
+  if (agora - ultimoDHT >= INTERVALO_DHT) {
+    ultimoDHT = agora;
+    atualizarDHT();
+  }
+
+  if (agora - ultimoOLED >= INTERVALO_OLED) {
+    ultimoOLED = agora;
+    atualizarOLED();
+  }
+
+  registrarHistorico();
+}
