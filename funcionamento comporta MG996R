@@ -1,0 +1,291 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// ===== WIFI DA ESP32 =====
+const char* nomeRede = "Silo-ESP32";
+const char* senhaRede = "Silo1234";
+
+// ===== SERVO MG996R =====
+const int PINO_SERVO = 19;
+
+const int ANGULO_FECHADO = 20;
+const int ANGULO_ABERTO = 110;
+
+Servo servoComporta;
+WebServer server(80);
+
+bool comportaAberta = false;
+
+// ===== PAGINA WEB =====
+const char paginaHTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0">
+
+  <title>Silo Inteligente</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: Arial, sans-serif;
+      background: #f1f5f2;
+      color: #24352b;
+    }
+
+    .container {
+      max-width: 430px;
+      margin: 30px auto;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+
+    header h1 {
+      margin-bottom: 8px;
+      color: #176b43;
+    }
+
+    header p {
+      color: #637168;
+    }
+
+    .card {
+      background: white;
+      border-radius: 18px;
+      padding: 24px;
+      margin-bottom: 18px;
+      box-shadow: 0 4px 16px #0000000d;
+    }
+
+    .status {
+      text-align: center;
+      margin: 22px 0;
+      padding: 14px;
+      border-radius: 12px;
+      background: #e5f5e9;
+      color: #176b43;
+      font-weight: bold;
+      font-size: 19px;
+    }
+
+    .status.aberta {
+      background: #fff0d9;
+      color: #9a5b00;
+    }
+
+    button {
+      width: 100%;
+      padding: 16px;
+      margin-top: 12px;
+      border: none;
+      border-radius: 12px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: wait;
+    }
+
+    .abrir {
+      background: #198754;
+      color: white;
+    }
+
+    .fechar {
+      background: #e5eae7;
+      color: #263a2e;
+    }
+
+    .aviso {
+      font-size: 13px;
+      color: #6c7970;
+      line-height: 1.5;
+      text-align: center;
+    }
+
+    #mensagem {
+      text-align: center;
+      min-height: 20px;
+      font-size: 14px;
+      color: #52645a;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+
+    <header>
+      <h1>Silo Inteligente</h1>
+      <p>Monitoramento e controle da comporta</p>
+    </header>
+
+    <section class="card">
+      <h2>Controle da comporta</h2>
+      <p>Acione o servo para liberar ou interromper
+         a saída dos grãos.</p>
+
+      <div id="status" class="status">
+        Consultando estado...
+      </div>
+
+      <button class="abrir" onclick="acionar('/abrir')">
+        ABRIR COMPORTA
+      </button>
+
+      <button class="fechar" onclick="acionar('/fechar')">
+        FECHAR COMPORTA
+      </button>
+
+      <p id="mensagem" aria-live="polite"></p>
+    </section>
+
+    <section class="card">
+      <h3>Conexão</h3>
+      <p>Controlador: ESP32</p>
+      <p>Atuador: Servo MG996R</p>
+      <p class="aviso">
+        O estado exibido corresponde ao último comando
+        enviado ao servo, não a uma confirmação física
+        da posição da comporta.
+      </p>
+    </section>
+
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const mensagemEl = document.getElementById('mensagem');
+    const botoes = document.querySelectorAll('button');
+
+    function atualizarEstado(aberta) {
+      statusEl.textContent =
+        aberta ? 'COMPORTA ABERTA' : 'COMPORTA FECHADA';
+
+      statusEl.classList.toggle('aberta', aberta);
+    }
+
+    async function consultarEstado() {
+      try {
+        const resposta = await fetch('/estado');
+        if (!resposta.ok) throw new Error();
+
+        const dados = await resposta.json();
+        atualizarEstado(dados.aberta);
+      } catch (erro) {
+        mensagemEl.textContent =
+          'Não foi possível consultar a ESP32.';
+      }
+    }
+
+    async function acionar(comando) {
+      botoes.forEach(botao => botao.disabled = true);
+      mensagemEl.textContent = 'Enviando comando...';
+
+      try {
+        const resposta = await fetch(comando, {
+          method: 'POST'
+        });
+
+        const dados = await resposta.json();
+
+        if (!resposta.ok) throw new Error();
+
+        atualizarEstado(dados.aberta);
+        mensagemEl.textContent = dados.mensagem;
+      } catch (erro) {
+        mensagemEl.textContent =
+          'Falha na comunicação. Tente novamente.';
+      } finally {
+        botoes.forEach(botao => botao.disabled = false);
+      }
+    }
+
+    consultarEstado();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ===== FUNCOES DE CONTROLE =====
+
+void abrirComporta() {
+  servoComporta.write(ANGULO_ABERTO);
+  comportaAberta = true;
+}
+
+void fecharComporta() {
+  servoComporta.write(ANGULO_FECHADO);
+  comportaAberta = false;
+}
+
+// ===== CONFIGURACAO =====
+
+void setup() {
+  Serial.begin(115200);
+
+  servoComporta.setPeriodHertz(50);
+  servoComporta.attach(PINO_SERVO, 500, 2400);
+
+  fecharComporta();
+  delay(500);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(nomeRede, senhaRede);
+
+  Serial.println();
+  Serial.println("Silo Inteligente iniciado!");
+  Serial.print("Rede Wi-Fi: ");
+  Serial.println(nomeRede);
+  Serial.print("Acesse: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html; charset=utf-8",
+                  paginaHTML);
+  });
+
+  server.on("/abrir", HTTP_POST, []() {
+    abrirComporta();
+
+    server.send(200, "application/json",
+      "{\"aberta\":true,\"mensagem\":\"Comando de abertura enviado.\"}");
+  });
+
+  server.on("/fechar", HTTP_POST, []() {
+    fecharComporta();
+
+    server.send(200, "application/json",
+      "{\"aberta\":false,\"mensagem\":\"Comando de fechamento enviado.\"}");
+  });
+
+  server.on("/estado", HTTP_GET, []() {
+    String resposta = "{\"aberta\":";
+    resposta += comportaAberta ? "true" : "false";
+    resposta += "}";
+
+    server.send(200, "application/json", resposta);
+  });
+
+  server.begin();
+  Serial.println("Servidor web iniciado!");
+}
+
+void loop() {
+  server.handleClient();
+}
