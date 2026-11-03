@@ -21,7 +21,7 @@
 #define OLED_SCL 22
 #define SERVO_PIN 19
 
-const float DISTANCIA_VAZIO = 20.15;
+const float DISTANCIA_VAZIO = 19.24;
 const float DISTANCIA_CHEIO = 2.00;
 
 const int ANGULO_FECHADO = 20;
