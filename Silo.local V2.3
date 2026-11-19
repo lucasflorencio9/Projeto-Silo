@@ -1,0 +1,1283 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <XPT2046_Touchscreen.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ESP32Servo.h>
+#include <math.h>
+
+// ==================================================
+// CONFIGURACOES DO SISTEMA
+// ==================================================
+// PLACA: ESP32-S3 (Arduino IDE: ESP32S3 Dev Module)
+// TFT ILI9341: CS=14, RST=21, DC=47, MOSI=45, SCLK=3, MISO=46, BL=9
+// TOUCH XPT2046: CLK=42, CS=1,
+//                MOSI=2, MISO=41
+// ULTRASSONICO: TRIG=5, ECHO=18
+// DHT11: DATA=15
+// SERVO MG996R: SINAL=16 (fonte externa 5-6 V; GND comum)
+// ATENCAO: ECHO do ultrassonico deve chegar ao ESP32-S3 com no maximo 3,3 V.
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define DHT_PIN 15
+#define DHT_TYPE DHT11
+
+// TFT ILI9341 - pinos confirmados nos testes
+#define TFT_CS   14
+#define TFT_RST  21
+#define TFT_DC   47
+#define TFT_MOSI 45
+#define TFT_SCLK 3
+#define TFT_MISO 46
+#define TFT_BL   9
+
+// Touch XPT2046 com navegacao por toque
+#define TOUCH_CLK  42
+#define TOUCH_CS   1
+#define TOUCH_MOSI 2
+#define TOUCH_MISO 41
+
+// Sensores e atuador
+#define SERVO_PIN 16
+
+// CALIBRACAO DO NIVEL
+// Distancia medida com o silo vazio e referencia de silo cheio.
+// A curva e uma aproximacao matematica suave, nao uma correcao
+// geometrica exata do formato do material dentro do silo.
+const float DISTANCIA_VAZIO = 20.15;
+const float DISTANCIA_CHEIO = 3.00;
+const float FATOR_LINEAR = 0.90;
+const float FATOR_QUADRATICO = 0.10;
+
+const int ANGULO_FECHADO = 20;
+const int ANGULO_ABERTO = 110;
+
+const char* SSID_AP = "Silo-ESP32";
+const char* SENHA_AP = "12345678";
+const char* HOSTNAME = "silo";
+
+SPIClass tftSPI(FSPI);
+SPIClass touchSPI(HSPI);
+Adafruit_ILI9341 tft(&tftSPI, TFT_DC, TFT_CS, TFT_RST);
+XPT2046_Touchscreen touch(TOUCH_CS, -1);
+DHT dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+Servo servoComporta;
+
+// ==================================================
+// VARIAVEIS
+// ==================================================
+
+float distancia = -1;
+float nivel = 0;
+float temperatura = NAN;
+float umidade = NAN;
+
+bool ultrassonicoOK = false;
+bool dhtOK = false;
+bool comportaAberta = false;
+
+enum StatusSilo {
+  STATUS_ERRO,
+  STATUS_BAIXO,
+  STATUS_NORMAL,
+  STATUS_ALTO,
+  STATUS_CHEIO
+};
+
+StatusSilo statusAtual = STATUS_ERRO;
+
+unsigned long ultimoUltrassonico = 0;
+unsigned long ultimoDHT = 0;
+unsigned long ultimaTFT = 0;
+unsigned long ultimaGravacaoHistorico = 0;
+
+const unsigned long INTERVALO_ULTRASSONICO = 1000;
+const unsigned long INTERVALO_DHT = 2000;
+const unsigned long INTERVALO_TFT = 1000;
+const unsigned long INTERVALO_HISTORICO = 5000;
+
+struct RegistroHistorico {
+  unsigned long tempo;
+  float nivel;
+  float temperatura;
+  float umidade;
+  bool nivelOK;
+  bool dhtValido;
+};
+
+// 1440 registros x 5 segundos = 2 horas
+const int MAX_REGISTROS = 1440;
+RegistroHistorico historico[MAX_REGISTROS];
+
+int totalRegistros = 0;
+int indiceHistorico = 0;
+
+// ==================================================
+// SENSOR ULTRASSONICO
+// ==================================================
+
+float medirDistancia() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duracao == 0) return -1;
+
+  return duracao * 0.0343 / 2.0;
+}
+
+float medirDistanciaMedia() {
+  float soma = 0;
+  int validas = 0;
+
+  for (int i = 0; i < 5; i++) {
+    float leitura = medirDistancia();
+
+    if (leitura > 0 && leitura < 400) {
+      soma += leitura;
+      validas++;
+    }
+
+    delay(20);
+  }
+
+  if (validas == 0) return -1;
+
+  return soma / validas;
+}
+
+void calcularNivel() {
+  if (!ultrassonicoOK || distancia < 0) return;
+
+  // Normaliza a distancia: 0 = vazio; 1 = cheio.
+  float x = (DISTANCIA_VAZIO - distancia) /
+            (DISTANCIA_VAZIO - DISTANCIA_CHEIO);
+
+  x = constrain(x, 0.0f, 1.0f);
+
+  // Curva suavemente nao linear.
+  nivel = 100.0f * (
+    FATOR_LINEAR * x +
+    FATOR_QUADRATICO * x * x
+  );
+
+  nivel = constrain(nivel, 0.0f, 100.0f);
+}
+
+void atualizarStatus() {
+  if (!ultrassonicoOK) {
+    statusAtual = STATUS_ERRO;
+    return;
+  }
+
+  switch (statusAtual) {
+    case STATUS_ERRO:
+      if (nivel < 25) statusAtual = STATUS_BAIXO;
+      else if (nivel < 75) statusAtual = STATUS_NORMAL;
+      else if (nivel < 90) statusAtual = STATUS_ALTO;
+      else statusAtual = STATUS_CHEIO;
+      break;
+
+    case STATUS_BAIXO:
+      if (nivel >= 27) {
+        if (nivel < 75) statusAtual = STATUS_NORMAL;
+        else if (nivel < 90) statusAtual = STATUS_ALTO;
+        else statusAtual = STATUS_CHEIO;
+      }
+      break;
+
+    case STATUS_NORMAL:
+      if (nivel < 23) statusAtual = STATUS_BAIXO;
+      else if (nivel >= 77) {
+        if (nivel < 90) statusAtual = STATUS_ALTO;
+        else statusAtual = STATUS_CHEIO;
+      }
+      break;
+
+    case STATUS_ALTO:
+      if (nivel < 73) {
+        if (nivel < 23) statusAtual = STATUS_BAIXO;
+        else statusAtual = STATUS_NORMAL;
+      } else if (nivel >= 92) {
+        statusAtual = STATUS_CHEIO;
+      }
+      break;
+
+    case STATUS_CHEIO:
+      if (nivel < 88) {
+        if (nivel < 73) {
+          if (nivel < 23) statusAtual = STATUS_BAIXO;
+          else statusAtual = STATUS_NORMAL;
+        } else {
+          statusAtual = STATUS_ALTO;
+        }
+      }
+      break;
+  }
+}
+
+String obterStatus() {
+  switch (statusAtual) {
+    case STATUS_BAIXO: return "BAIXO";
+    case STATUS_NORMAL: return "NORMAL";
+    case STATUS_ALTO: return "ALTO";
+    case STATUS_CHEIO: return "CHEIO";
+    default: return "ERRO SENSOR";
+  }
+}
+
+void atualizarUltrassonico() {
+  float novaDistancia = medirDistanciaMedia();
+
+  if (novaDistancia > 0) {
+    distancia = novaDistancia;
+    ultrassonicoOK = true;
+    calcularNivel();
+    atualizarStatus();
+  } else {
+    ultrassonicoOK = false;
+    statusAtual = STATUS_ERRO;
+  }
+}
+
+// ==================================================
+// SENSOR DHT11
+// ==================================================
+
+void atualizarDHT() {
+  float t = dht.readTemperature();
+  float u = dht.readHumidity();
+
+  if (!isnan(t) && !isnan(u)) {
+    temperatura = t;
+    umidade = u;
+    dhtOK = true;
+  } else {
+    dhtOK = false;
+  }
+}
+
+// ==================================================
+// TEMPO DE FUNCIONAMENTO
+// ==================================================
+
+String obterUptime() {
+  unsigned long s = millis() / 1000UL;
+  unsigned long dias = s / 86400UL;
+  s %= 86400UL;
+
+  unsigned long horas = s / 3600UL;
+  s %= 3600UL;
+
+  unsigned long minutos = s / 60UL;
+  s %= 60UL;
+
+  char buffer[40];
+
+  snprintf(buffer, sizeof(buffer),
+    "%lu d %02lu:%02lu:%02lu",
+    dias, horas, minutos, s);
+
+  return String(buffer);
+}
+
+// ==================================================
+// HISTORICO DOS GRAFICOS
+// ==================================================
+
+void registrarHistorico() {
+  unsigned long agora = millis();
+
+  if (totalRegistros > 0 &&
+      agora - ultimaGravacaoHistorico < INTERVALO_HISTORICO) {
+    return;
+  }
+
+  ultimaGravacaoHistorico = agora;
+
+  RegistroHistorico &r = historico[indiceHistorico];
+
+  r.tempo = agora / 1000UL;
+  r.nivel = nivel;
+  r.temperatura = temperatura;
+  r.umidade = umidade;
+  r.nivelOK = ultrassonicoOK;
+  r.dhtValido = dhtOK;
+
+  indiceHistorico = (indiceHistorico + 1) % MAX_REGISTROS;
+
+  if (totalRegistros < MAX_REGISTROS) {
+    totalRegistros++;
+  }
+}
+
+// ==================================================
+// INTERFACE TFT + TOUCH
+// ==================================================
+
+enum TelaAtual { TELA_HOME, TELA_GRAFICOS, TELA_COMPORTA };
+TelaAtual telaAtual = TELA_HOME;
+
+enum GraficoAtual { GRAF_NIVEL, GRAF_TEMPERATURA, GRAF_UMIDADE };
+GraficoAtual graficoAtual = GRAF_NIVEL;
+
+int periodoGrafico = 7200;
+
+const int TOUCH_X_MIN = 250;
+const int TOUCH_X_MAX = 3850;
+const int TOUCH_Y_MIN = 250;
+const int TOUCH_Y_MAX = 3850;
+const bool TOUCH_INVERTER_X = false;
+const bool TOUCH_INVERTER_Y = false;
+const bool TOUCH_TROCAR_EIXOS = false;
+
+const uint16_t COR_FUNDO = 0x0841;
+const uint16_t COR_CABECALHO = 0x10A2;
+const uint16_t COR_CARTAO = 0x18E3;
+const uint16_t COR_BORDA = 0x39E7;
+const uint16_t COR_TEXTO = 0xFFFF;
+const uint16_t COR_SUAVE = 0xBDF7;
+const uint16_t COR_AZUL = 0x3D7F;
+const uint16_t COR_VERDE = 0x2E86;
+const uint16_t COR_LARANJA = 0xFD20;
+const uint16_t COR_VERMELHO = 0xF986;
+const uint16_t COR_CIANO = 0x5DFF;
+
+unsigned long ultimoToque = 0;
+const unsigned long DEBOUNCE_TOQUE = 250;
+bool telaPrecisaRedesenhar = true;
+unsigned long ultimaAtualizacaoGrafico = 0;
+
+void desenharCabecalho(const char *subtitulo) {
+  tft.fillScreen(COR_FUNDO);
+  tft.fillRect(0, 0, 320, 36, COR_CABECALHO);
+  tft.setTextColor(COR_TEXTO);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.print("SUPERVISORIO DO SILO");
+  tft.setTextSize(1);
+  tft.setTextColor(COR_SUAVE);
+  tft.setCursor(11, 42);
+  tft.print(subtitulo);
+}
+
+void desenharNavegacao() {
+  const int y = 207, h = 33, w = 104;
+  const char *nomes[] = {"HOME", "GRAFICOS", "COMPORTA"};
+  for (int i = 0; i < 3; i++) {
+    uint16_t cor = ((int)telaAtual == i) ? COR_AZUL : COR_CARTAO;
+    tft.fillRoundRect(i * 107 + 2, y, w, h, 6, cor);
+    tft.drawRoundRect(i * 107 + 2, y, w, h, 6, COR_BORDA);
+    tft.setTextSize(1);
+    tft.setTextColor(COR_TEXTO);
+    int16_t x1, y1;
+    uint16_t tw, th;
+    tft.getTextBounds(nomes[i], 0, 0, &x1, &y1, &tw, &th);
+    tft.setCursor(i * 107 + 2 + (w - tw) / 2, y + 13);
+    tft.print(nomes[i]);
+  }
+}
+
+uint16_t corDoStatus() {
+  if (!ultrassonicoOK) return COR_VERMELHO;
+  if (statusAtual == STATUS_BAIXO) return COR_VERMELHO;
+  if (statusAtual == STATUS_NORMAL) return COR_VERDE;
+  if (statusAtual == STATUS_ALTO) return COR_LARANJA;
+  return COR_CIANO;
+}
+
+void desenharCartao(int x, int y, int w, int h, const char *titulo) {
+  tft.fillRoundRect(x, y, w, h, 8, COR_CARTAO);
+  tft.drawRoundRect(x, y, w, h, 8, COR_BORDA);
+  tft.setTextSize(1);
+  tft.setTextColor(COR_SUAVE);
+  tft.setCursor(x + 9, y + 8);
+  tft.print(titulo);
+}
+
+void desenharHome() {
+  desenharCabecalho("MONITORAMENTO EM TEMPO REAL");
+
+  desenharCartao(8, 58, 148, 140, "NIVEL DO SILO");
+  tft.setTextColor(ultrassonicoOK ? COR_LARANJA : COR_VERMELHO, COR_CARTAO);
+  tft.setTextSize(4);
+  tft.setCursor(18, 82);
+  if (ultrassonicoOK) {
+    tft.print((int)round(nivel));
+    tft.print("%");
+  } else {
+    tft.setTextSize(2);
+    tft.print("ERRO");
+  }
+
+  int sx = 112, sy = 82, sw = 28, sh = 88;
+  tft.drawRoundRect(sx, sy, sw, sh, 8, COR_SUAVE);
+  tft.drawFastHLine(sx + 5, sy + 8, sw - 10, COR_SUAVE);
+  if (ultrassonicoOK) {
+    int fillH = (int)(constrain(nivel, 0.0f, 100.0f) * (sh - 12) / 100.0f);
+    uint16_t c = nivel < 25 ? COR_VERMELHO : (nivel < 75 ? COR_LARANJA : COR_VERDE);
+    if (fillH > 0) tft.fillRoundRect(sx + 4, sy + sh - 6 - fillH, sw - 8, fillH, 4, c);
+  }
+  tft.setTextSize(1);
+  tft.setTextColor(corDoStatus(), COR_CARTAO);
+  tft.setCursor(18, 145);
+  tft.print(obterStatus());
+
+  desenharCartao(164, 58, 148, 65, "TEMPERATURA");
+  tft.setTextSize(2);
+  tft.setTextColor(dhtOK ? COR_TEXTO : COR_VERMELHO, COR_CARTAO);
+  tft.setCursor(174, 85);
+  if (dhtOK) { tft.print(temperatura, 1); tft.print(" C"); }
+  else tft.print("-- C");
+
+  desenharCartao(164, 132, 148, 66, "UMIDADE");
+  tft.setTextSize(2);
+  tft.setTextColor(dhtOK ? COR_CIANO : COR_VERMELHO, COR_CARTAO);
+  tft.setCursor(174, 159);
+  if (dhtOK) { tft.print(umidade, 0); tft.print(" %"); }
+  else tft.print("-- %");
+
+  tft.setTextSize(1);
+  tft.setTextColor(COR_SUAVE);
+  tft.setCursor(12, 188);
+  tft.print("DIST: ");
+  tft.setTextColor(ultrassonicoOK ? COR_TEXTO : COR_VERMELHO);
+  if (ultrassonicoOK) { tft.print(distancia, 1); tft.print(" cm"); }
+  else tft.print("SEM ECO");
+
+  desenharNavegacao();
+}
+
+float valorDoRegistro(int pos) {
+  if (graficoAtual == GRAF_NIVEL) {
+    return historico[pos].nivelOK ? historico[pos].nivel : NAN;
+  }
+
+  if (!historico[pos].dhtValido) return NAN;
+
+  return graficoAtual == GRAF_TEMPERATURA
+         ? historico[pos].temperatura
+         : historico[pos].umidade;
+}
+
+void desenharPlotGrafico() {
+  const int gx = 34, gy = 121, gw = 276, gh = 67;
+  tft.fillRoundRect(8, 116, 304, 82, 6, COR_CARTAO);
+  for (int i = 0; i <= 4; i++) {
+    int yy = gy + i * (gh / 4);
+    tft.drawFastHLine(gx, yy, gw, 0x39E7);
+  }
+
+  unsigned long agora = millis() / 1000UL;
+  float minV = 0, maxV = 100;
+  if (graficoAtual == GRAF_TEMPERATURA) maxV = 50;
+
+  int pontos = 0;
+  int ultimoX = -1, ultimoY = -1;
+  uint16_t corLinha = graficoAtual == GRAF_NIVEL ? COR_LARANJA :
+                      (graficoAtual == GRAF_TEMPERATURA ? COR_VERMELHO : COR_CIANO);
+
+  int inicio = (indiceHistorico - totalRegistros + MAX_REGISTROS) % MAX_REGISTROS;
+  for (int i = 0; i < totalRegistros; i++) {
+    int pos = (inicio + i) % MAX_REGISTROS;
+    RegistroHistorico &r = historico[pos];
+    if (agora < r.tempo || agora - r.tempo > (unsigned long)periodoGrafico) continue;
+
+    float v = valorDoRegistro(pos);
+    if (isnan(v)) continue;
+    int x = gx + (int)((float)(r.tempo - (agora - periodoGrafico)) * gw / periodoGrafico);
+    int y = gy + gh - (int)((constrain(v, minV, maxV) - minV) * gh / (maxV - minV));
+    x = constrain(x, gx, gx + gw);
+    y = constrain(y, gy, gy + gh);
+    if (ultimoX >= 0) tft.drawLine(ultimoX, ultimoY, x, y, corLinha);
+    tft.fillCircle(x, y, 2, corLinha);
+    ultimoX = x;
+    ultimoY = y;
+    pontos++;
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(COR_SUAVE, COR_CARTAO);
+  tft.setCursor(10, 123);
+  tft.print(maxV, 0);
+  tft.setCursor(10, 181);
+  tft.print(minV, 0);
+  tft.setCursor(12, 188);
+  tft.print(pontos);
+  tft.print(" amostras");
+}
+void desenharGrafico() {
+  desenharCabecalho("HISTORICO DO PROCESSO");
+
+  const char *tipos[] = {"NIVEL", "TEMP.", "UMID."};
+  for (int i = 0; i < 3; i++) {
+    int x = 8 + i * 104;
+    uint16_t c = ((int)graficoAtual == i) ? COR_AZUL : COR_CARTAO;
+    tft.fillRoundRect(x, 57, 96, 25, 5, c);
+    tft.drawRoundRect(x, 57, 96, 25, 5, COR_BORDA);
+    tft.setTextSize(1);
+    tft.setTextColor(COR_TEXTO);
+    tft.setCursor(x + 29, 66);
+    tft.print(tipos[i]);
+  }
+
+  const int periodos[] = {1800, 3600, 7200};
+  const char *periodosTxt[] = {"30 MIN", "1 HORA", "2 HORAS"};
+  for (int i = 0; i < 3; i++) {
+    int x = 8 + i * 104;
+    uint16_t c = (periodoGrafico == periodos[i]) ? COR_VERDE : COR_CARTAO;
+    tft.fillRoundRect(x, 88, 96, 22, 5, c);
+    tft.drawRoundRect(x, 88, 96, 22, 5, COR_BORDA);
+    tft.setTextSize(1);
+    tft.setTextColor(COR_TEXTO);
+    tft.setCursor(x + 29, 95);
+    tft.print(periodosTxt[i]);
+  }
+
+  desenharPlotGrafico();
+  desenharNavegacao();
+}
+
+// Atualiza somente os valores da HOME, sem apagar os cartoes ou o layout.
+void atualizarHomeDinamica() {
+  // Valor percentual
+  tft.fillRect(14, 78, 94, 53, COR_CARTAO);
+  tft.setTextColor(ultrassonicoOK ? COR_LARANJA : COR_VERMELHO, COR_CARTAO);
+  tft.setTextSize(4);
+  tft.setCursor(18, 82);
+  if (ultrassonicoOK) {
+    tft.print((int)round(nivel));
+    tft.print("%");
+  } else {
+    tft.setTextSize(2);
+    tft.print("ERRO");
+  }
+
+  // Coluna de nivel do silo: limpa somente a parte interna.
+  int sx = 112, sy = 82, sw = 28, sh = 88;
+  tft.fillRect(sx + 3, sy + 3, sw - 6, sh - 6, COR_CARTAO);
+  if (ultrassonicoOK) {
+    int fillH = (int)(constrain(nivel, 0.0f, 100.0f) * (sh - 12) / 100.0f);
+    uint16_t c = nivel < 25 ? COR_VERMELHO : (nivel < 75 ? COR_LARANJA : COR_VERDE);
+    if (fillH > 0) tft.fillRoundRect(sx + 4, sy + sh - 6 - fillH, sw - 8, fillH, 4, c);
+  }
+
+  // Estado do silo
+  tft.fillRect(15, 143, 92, 17, COR_CARTAO);
+  tft.setTextSize(1);
+  tft.setTextColor(corDoStatus(), COR_CARTAO);
+  tft.setCursor(18, 145);
+  tft.print(obterStatus());
+
+  // Temperatura e umidade
+  tft.fillRect(171, 82, 132, 31, COR_CARTAO);
+  tft.setTextSize(2);
+  tft.setTextColor(dhtOK ? COR_TEXTO : COR_VERMELHO, COR_CARTAO);
+  tft.setCursor(174, 85);
+  if (dhtOK) { tft.print(temperatura, 1); tft.print(" C"); }
+  else tft.print("-- C");
+
+  tft.fillRect(171, 156, 132, 31, COR_CARTAO);
+  tft.setTextSize(2);
+  tft.setTextColor(dhtOK ? COR_CIANO : COR_VERMELHO, COR_CARTAO);
+  tft.setCursor(174, 159);
+  if (dhtOK) { tft.print(umidade, 0); tft.print(" %"); }
+  else tft.print("-- %");
+
+  // Distancia medida
+  tft.fillRect(42, 181, 105, 15, COR_FUNDO);
+  tft.setTextSize(1);
+  tft.setTextColor(ultrassonicoOK ? COR_TEXTO : COR_VERMELHO, COR_FUNDO);
+  tft.setCursor(43, 188);
+  if (ultrassonicoOK) { tft.print(distancia, 1); tft.print(" cm"); }
+  else tft.print("SEM ECO");
+}
+
+// Atualiza somente o texto do estado da comporta.
+void atualizarEstadoComportaTFT() {
+  tft.fillRect(27, 86, 245, 29, COR_CARTAO);
+  tft.setTextSize(3);
+  tft.setTextColor(comportaAberta ? COR_LARANJA : COR_VERDE, COR_CARTAO);
+  tft.setCursor(30, 88);
+  tft.print(comportaAberta ? "ABERTA" : "FECHADA");
+}
+
+void desenharComporta() {
+  desenharCabecalho("ACIONAMENTO DO SERVO MG996R");
+
+  tft.fillRoundRect(18, 60, 284, 58, 8, COR_CARTAO);
+  tft.drawRoundRect(18, 60, 284, 58, 8, COR_BORDA);
+  tft.setTextSize(1);
+  tft.setTextColor(COR_SUAVE);
+  tft.setCursor(30, 70);
+  tft.print("ESTADO DO COMANDO");
+  tft.setTextSize(3);
+  tft.setTextColor(comportaAberta ? COR_LARANJA : COR_VERDE, COR_CARTAO);
+  tft.setCursor(30, 88);
+  tft.print(comportaAberta ? "ABERTA" : "FECHADA");
+
+  tft.fillRoundRect(18, 130, 136, 58, 8, COR_VERDE);
+  tft.drawRoundRect(18, 130, 136, 58, 8, COR_TEXTO);
+  tft.setTextSize(2);
+  tft.setTextColor(COR_TEXTO);
+  tft.setCursor(42, 153);
+  tft.print("ABRIR");
+
+  tft.fillRoundRect(166, 130, 136, 58, 8, 0x4208);
+  tft.drawRoundRect(166, 130, 136, 58, 8, COR_TEXTO);
+  tft.setCursor(183, 153);
+  tft.print("FECHAR");
+
+  tft.setTextSize(1);
+  tft.setTextColor(COR_SUAVE);
+  tft.setCursor(20, 194);
+  tft.print("Estado = ultimo comando enviado.");
+  desenharNavegacao();
+}
+
+void desenharTelaAtual() {
+  if (telaAtual == TELA_HOME) desenharHome();
+  else if (telaAtual == TELA_GRAFICOS) desenharGrafico();
+  else desenharComporta();
+  telaPrecisaRedesenhar = false;
+}
+
+bool lerToque(int &x, int &y) {
+  if (!touch.touched()) return false;
+  TS_Point p = touch.getPoint();
+
+  int rx = p.x;
+  int ry = p.y;
+  if (TOUCH_TROCAR_EIXOS) {
+    int temp = rx; rx = ry; ry = temp;
+  }
+
+  x = map(rx, TOUCH_X_MIN, TOUCH_X_MAX, 0, 319);
+  y = map(ry, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, 239);
+  if (TOUCH_INVERTER_X) x = 319 - x;
+  if (TOUCH_INVERTER_Y) y = 239 - y;
+  x = constrain(x, 0, 319);
+  y = constrain(y, 0, 239);
+  return true;
+}
+
+void processarToque() {
+  int x, y;
+  if (!lerToque(x, y)) return;
+  if (millis() - ultimoToque < DEBOUNCE_TOQUE) return;
+  ultimoToque = millis();
+
+  if (y >= 207) {
+    if (x < 106) telaAtual = TELA_HOME;
+    else if (x < 213) telaAtual = TELA_GRAFICOS;
+    else telaAtual = TELA_COMPORTA;
+    telaPrecisaRedesenhar = true;
+    return;
+  }
+
+  if (telaAtual == TELA_GRAFICOS) {
+    if (y >= 55 && y <= 84) {
+      if (x < 107) graficoAtual = GRAF_NIVEL;
+      else if (x < 213) graficoAtual = GRAF_TEMPERATURA;
+      else graficoAtual = GRAF_UMIDADE;
+      telaPrecisaRedesenhar = true;
+    } else if (y >= 86 && y <= 112) {
+      if (x < 107) periodoGrafico = 1800;
+      else if (x < 213) periodoGrafico = 3600;
+      else periodoGrafico = 7200;
+      telaPrecisaRedesenhar = true;
+    }
+  } else if (telaAtual == TELA_COMPORTA && y >= 125 && y <= 195) {
+    if (x < 160) {
+      servoComporta.write(ANGULO_ABERTO);
+      comportaAberta = true;
+    } else {
+      servoComporta.write(ANGULO_FECHADO);
+      comportaAberta = false;
+    }
+    atualizarEstadoComportaTFT();
+  }
+}
+
+void atualizarTFT() {
+  // Uma tela inteira so e redesenhada quando o usuario troca de pagina
+  // ou altera uma opcao do grafico.
+  if (telaPrecisaRedesenhar) {
+    desenharTelaAtual();
+    ultimaAtualizacaoGrafico = millis();
+    return;
+  }
+
+  if (telaAtual == TELA_HOME) {
+    atualizarHomeDinamica();
+  } else if (telaAtual == TELA_GRAFICOS &&
+             millis() - ultimaAtualizacaoGrafico >= 5000) {
+    desenharPlotGrafico();
+    ultimaAtualizacaoGrafico = millis();
+  }
+  // Na tela COMPORTA nao ha redesenho periodico. O estado e atualizado
+  // imediatamente apos o toque que envia o comando ao servo.
+}
+
+void inicializarTFT() {
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  tftSPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
+  tft.begin(20000000);
+  tft.setRotation(1);
+
+  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  touch.begin(touchSPI);
+  touch.setRotation(1);
+
+  tft.fillScreen(COR_FUNDO);
+  tft.setTextColor(COR_TEXTO);
+  tft.setTextSize(2);
+  tft.setCursor(25, 75);
+  tft.println("SUPERVISORIO DO SILO");
+  tft.setTextSize(1);
+  tft.setCursor(25, 110);
+  tft.println("Inicializando tela e touch...");
+}
+
+// ==================================================
+// PAGINA HOME
+// ==================================================
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Silo - Home</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
+header{background:#111827;padding:16px 22px;display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+nav{display:flex;gap:7px;flex-wrap:wrap}
+nav a{color:#cbd5e1;text-decoration:none;padding:10px;
+border:1px solid #334155;border-radius:7px;font-size:13px}
+nav a.active,nav a:hover{background:#1d4ed8;color:white}
+main{max-width:1050px;margin:auto;padding:18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden}
+.ph{padding:15px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.body{padding:18px}
+.silo{width:150px;height:215px;margin:8px auto 16px;
+border:3px solid #64748b;border-radius:70px 70px 18px 18px;
+position:relative;overflow:hidden;background:#0f172a}
+.material{position:absolute;bottom:0;width:100%;height:0%;
+background:linear-gradient(#f59e0b,#92400e);transition:height .5s}
+.level{text-align:center;font-size:30px;font-weight:bold}
+.status{text-align:center;padding:8px;color:#93c5fd}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.metric{padding:14px;background:#0f172a;border:1px solid #263244;border-radius:8px}
+.label{font-size:11px;color:#94a3b8}
+.value{font-size:24px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere}
+.rows{font-size:13px;margin-top:16px}
+.rows div{padding:11px 0;border-bottom:1px solid #263244}
+.ok{color:#4ade80}.err{color:#f87171}
+footer{text-align:center;padding:20px;color:#64748b;font-size:11px}
+@media(max-width:680px){.grid{grid-template-columns:1fr}main{padding:12px}}
+</style></head><body>
+<header>
+<div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">MONITORAMENTO EM TEMPO REAL</div></div>
+<nav>
+<a class="active" href="http://silo.local/">Home</a>
+<a href="http://silo.local/graficos">Gráficos</a>
+<a href="http://silo.local/comporta">Comporta</a>
+</nav>
+</header>
+<main><div class="grid">
+<section class="panel"><div class="ph">NÍVEL DO SILO</div><div class="body">
+<div class="silo"><div class="material" id="material"></div></div>
+<div class="level"><span id="nivel">--</span>%</div>
+<div class="status" id="status">AGUARDANDO</div>
+</div></section>
+<section class="panel"><div class="ph">VARIÁVEIS DE PROCESSO</div><div class="body">
+<div class="metrics">
+<div class="metric"><div class="label">Temperatura</div><div class="value"><span id="temp">--</span> °C</div></div>
+<div class="metric"><div class="label">Umidade</div><div class="value"><span id="umid">--</span> %</div></div>
+<div class="metric"><div class="label">Distância</div><div class="value"><span id="dist">--</span> cm</div></div>
+<div class="metric"><div class="label">Funcionamento</div><div class="value" style="font-size:14px" id="uptime">--</div></div>
+</div>
+<div class="rows">
+<div>Ultrassônico: <b id="ultra">--</b></div>
+<div>DHT11: <b id="dht">--</b></div>
+<div>Comporta: <b id="gate">--</b></div>
+</div>
+</div></section>
+</div></main>
+<footer>SISTEMA DE MONITORAMENTO DE SILO • ESP32</footer>
+<script>
+async function atualizar(){
+try{
+let r=await fetch('/dados',{cache:'no-store'});
+let d=await r.json();
+document.getElementById('nivel').textContent=d.sensorUltrassonico?Math.round(d.nivel):'ERRO';
+document.getElementById('material').style.height=d.sensorUltrassonico?d.nivel+'%':'0%';
+document.getElementById('status').textContent=d.status;
+document.getElementById('temp').textContent=d.temperatura===null?'--':Number(d.temperatura).toFixed(1);
+document.getElementById('umid').textContent=d.umidade===null?'--':Number(d.umidade).toFixed(1);
+document.getElementById('dist').textContent=d.distancia===null?'--':Number(d.distancia).toFixed(2);
+document.getElementById('uptime').textContent=d.uptime;
+let u=document.getElementById('ultra');
+u.textContent=d.sensorUltrassonico?'OK':'ERRO';u.className=d.sensorUltrassonico?'ok':'err';
+let h=document.getElementById('dht');
+h.textContent=d.sensorDHT?'OK':'ERRO';h.className=d.sensorDHT?'ok':'err';
+document.getElementById('gate').textContent=d.comportaAberta?'ABERTA':'FECHADA';
+}catch(e){console.log(e)}
+}
+atualizar();setInterval(atualizar,1500);
+</script></body></html>
+)rawliteral";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ==================================================
+// PAGINA GRAFICOS
+// ==================================================
+
+void handleGraficos() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Silo - Gráficos</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
+header{background:#111827;padding:16px 22px;display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+nav{display:flex;gap:7px;flex-wrap:wrap}
+nav a{color:#cbd5e1;text-decoration:none;padding:10px;
+border:1px solid #334155;border-radius:7px;font-size:13px}
+nav a.active,nav a:hover{background:#1d4ed8;color:white}
+main{max-width:1050px;margin:auto;padding:18px}
+.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden;margin-bottom:16px}
+.ph{padding:15px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.chart{padding:12px}
+canvas{display:block;width:100%;height:220px}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.metric{background:#111827;border:1px solid #263244;border-radius:8px;padding:15px}
+.label{font-size:11px;color:#94a3b8}.value{font-size:22px;margin-top:8px;font-weight:bold}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+button{background:#1f2937;color:white;border:1px solid #334155;border-radius:7px;padding:10px;cursor:pointer}
+button.active{background:#1d4ed8}
+.note{font-size:11px;color:#64748b;padding:0 4px 12px}
+@media(max-width:600px){main{padding:12px}.metrics{grid-template-columns:1fr}}
+</style></head><body>
+<header><div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">HISTÓRICO DO PROCESSO</div></div>
+<nav>
+<a href="http://silo.local/">Home</a>
+<a class="active" href="http://silo.local/graficos">Gráficos</a>
+<a href="http://silo.local/comporta">Comporta</a>
+</nav></header>
+<main>
+<div class="filters">
+<button data-period="1800">30 minutos</button>
+<button data-period="3600">1 hora</button>
+<button class="active" data-period="7200">2 horas</button>
+</div>
+<div class="metrics">
+<div class="metric"><div class="label">Nível atual</div><div class="value" id="nv">--</div></div>
+<div class="metric"><div class="label">Temperatura</div><div class="value" id="tp">--</div></div>
+<div class="metric"><div class="label">Umidade</div><div class="value" id="um">--</div></div>
+</div>
+<section class="panel"><div class="ph">NÍVEL DO SILO (%)</div><div class="chart"><canvas id="cNivel"></canvas></div></section>
+<section class="panel"><div class="ph">TEMPERATURA (°C)</div><div class="chart"><canvas id="cTemp"></canvas></div></section>
+<section class="panel"><div class="ph">UMIDADE (%)</div><div class="chart"><canvas id="cUmid"></canvas></div></section>
+<div class="note" id="nota">Histórico temporário armazenado na memória da ESP32.</div>
+</main>
+<script>
+let periodo=7200,hist=[];
+document.querySelectorAll('[data-period]').forEach(b=>{
+b.onclick=()=>{
+document.querySelectorAll('[data-period]').forEach(x=>x.classList.remove('active'));
+b.classList.add('active');periodo=Number(b.dataset.period);desenharTodos();
+};
+});
+function grafico(id,chave,cor,minFixo,maxFixo){
+const c=document.getElementById(id),rect=c.getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+c.width=Math.max(1,rect.width*ratio);c.height=Math.max(1,rect.height*ratio);
+const ctx=c.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);
+const w=rect.width,h=rect.height,m={l:42,r:12,t:15,b:28},pw=w-m.l-m.r,ph=h-m.t-m.b;
+ctx.clearRect(0,0,w,h);
+const agora=hist.length?hist[hist.length-1].tempo:0;
+const dados=hist.filter(d=>d.tempo>=agora-periodo&&d[chave]!==null&&Number.isFinite(d[chave]));
+let ymin=minFixo,ymax=maxFixo;
+if(ymin===null||ymax===null){
+if(dados.length){let v=dados.map(d=>d[chave]),lo=Math.min(...v),hi=Math.max(...v),f=Math.max((hi-lo)*.2,1);ymin=Math.floor(lo-f);ymax=Math.ceil(hi+f);}
+else{ymin=0;ymax=10;}
+}
+ctx.font='11px Arial';ctx.strokeStyle='#263244';ctx.fillStyle='#94a3b8';
+for(let i=0;i<=4;i++){
+let y=m.t+ph*i/4;ctx.beginPath();ctx.moveTo(m.l,y);ctx.lineTo(w-m.r,y);ctx.stroke();
+ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText((ymax-(ymax-ymin)*i/4).toFixed(1),m.l-6,y);
+}
+if(!dados.length){ctx.textAlign='center';ctx.fillText('Aguardando dados...',w/2,h/2);return;}
+ctx.strokeStyle=cor;ctx.lineWidth=2.5;ctx.beginPath();
+dados.forEach((d,i)=>{
+let x=m.l+Math.max(0,Math.min(1,(d.tempo-(agora-periodo))/periodo))*pw;
+let y=m.t+(ymax-d[chave])/(ymax-ymin)*ph;
+if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+});
+ctx.stroke();
+}
+function desenharTodos(){
+grafico('cNivel','nivel','#f59e0b',0,100);
+grafico('cTemp','temperatura','#fb7185',null,null);
+grafico('cUmid','umidade','#38bdf8',0,100);
+let agora=hist.length?hist[hist.length-1].tempo:0;
+let vis=hist.filter(d=>d.tempo>=agora-periodo);
+document.getElementById('nota').textContent=vis.length+' amostras no período. Histórico máximo de 2 horas.';
+}
+async function atualizar(){
+try{
+let r=await fetch('/historico',{cache:'no-store'});hist=await r.json();
+let n=hist.filter(d=>d.nivel!==null),t=hist.filter(d=>d.temperatura!==null),u=hist.filter(d=>d.umidade!==null);
+document.getElementById('nv').textContent=n.length?Number(n[n.length-1].nivel).toFixed(1)+'%':'--';
+document.getElementById('tp').textContent=t.length?Number(t[t.length-1].temperatura).toFixed(1)+' °C':'--';
+document.getElementById('um').textContent=u.length?Number(u[u.length-1].umidade).toFixed(1)+'%':'--';
+desenharTodos();
+}catch(e){console.log(e)}
+}
+window.addEventListener('resize',desenharTodos);
+atualizar();setInterval(atualizar,5000);
+</script></body></html>
+)rawliteral";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+// ==================================================
+// PAGINA COMPORTA
+// ==================================================
+
+void handleComporta() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Silo - Comporta</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
+header{background:#111827;padding:16px 22px;display:flex;
+justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+nav{display:flex;gap:7px;flex-wrap:wrap}
+nav a{color:#cbd5e1;text-decoration:none;padding:10px;
+border:1px solid #334155;border-radius:7px;font-size:13px}
+nav a.active,nav a:hover{background:#1d4ed8;color:white}
+main{max-width:600px;margin:auto;padding:18px}
+.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden}
+.ph{padding:16px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.content{padding:22px}
+p{font-size:13px;color:#94a3b8;line-height:1.6}
+.gate{width:120px;height:120px;margin:24px auto;border:3px solid #475569;
+border-radius:18px;background:#0f172a;display:flex;align-items:center;
+justify-content:center;font-size:48px}
+.status{padding:14px;border-radius:8px;text-align:center;font-weight:bold;
+background:#172554;color:#93c5fd;margin:20px 0}
+.status.open{background:#422006;color:#fbbf24}
+button{width:100%;padding:16px;border:0;border-radius:8px;
+font-weight:bold;font-size:14px;margin-top:10px;cursor:pointer}
+button:disabled{opacity:.5}
+.open{background:#15803d;color:white}.close{background:#334155;color:white}
+#mensagem{text-align:center;min-height:20px}
+.note{font-size:11px;color:#64748b}
+@media(max-width:600px){main{padding:12px}}
+</style></head><body>
+<header><div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">CONTROLE DA COMPORTA</div></div>
+<nav>
+<a href="http://silo.local/">Home</a>
+<a href="http://silo.local/graficos">Gráficos</a>
+<a class="active" href="http://silo.local/comporta">Comporta</a>
+</nav></header>
+<main><section class="panel"><div class="ph">CONTROLE DA COMPORTA</div>
+<div class="content">
+<p>Utilize os botões para abrir ou fechar a comporta acionada pelo servo MG996R.</p>
+<div class="gate" id="icone">▤</div>
+<div class="status" id="estado">CONSULTANDO...</div>
+<button class="open" id="btnAbrir" onclick="acionar('/abrir')">ABRIR COMPORTA</button>
+<button class="close" id="btnFechar" onclick="acionar('/fechar')">FECHAR COMPORTA</button>
+<p id="mensagem" aria-live="polite"></p>
+<p class="note">O estado mostrado corresponde ao último comando enviado. Sem um sensor de posição, não há confirmação física da abertura ou do fechamento.</p>
+</div></section></main>
+<script>
+const estadoEl=document.getElementById('estado');
+const mensagemEl=document.getElementById('mensagem');
+const iconeEl=document.getElementById('icone');
+const botoes=[document.getElementById('btnAbrir'),document.getElementById('btnFechar')];
+function mostrarEstado(aberta){
+estadoEl.textContent=aberta?'COMPORTA ABERTA':'COMPORTA FECHADA';
+estadoEl.className=aberta?'status open':'status';
+iconeEl.textContent=aberta?'▱':'▤';
+}
+async function consultar(){
+try{let r=await fetch('/estadoComporta',{cache:'no-store'});if(!r.ok)throw Error();let d=await r.json();mostrarEstado(d.aberta);}
+catch(e){estadoEl.textContent='SEM COMUNICAÇÃO';}
+}
+async function acionar(url){
+botoes.forEach(b=>b.disabled=true);mensagemEl.textContent='Enviando comando...';
+try{
+let r=await fetch(url,{method:'POST'});let d=await r.json();if(!r.ok)throw Error();
+mostrarEstado(d.aberta);mensagemEl.textContent=d.mensagem;
+}catch(e){mensagemEl.textContent='Falha de comunicação com a ESP32.';}
+finally{botoes.forEach(b=>b.disabled=false);}
+}
+consultar();
+</script></body></html>
+)rawliteral";
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ==================================================
+// CONTROLE DA COMPORTA
+// ==================================================
+
+void handleAbrirComporta() {
+  servoComporta.write(ANGULO_ABERTO);
+  comportaAberta = true;
+
+  server.send(200, "application/json",
+    "{\"aberta\":true,\"mensagem\":\"Comando de abertura enviado.\"}");
+}
+
+void handleFecharComporta() {
+  servoComporta.write(ANGULO_FECHADO);
+  comportaAberta = false;
+
+  server.send(200, "application/json",
+    "{\"aberta\":false,\"mensagem\":\"Comando de fechamento enviado.\"}");
+}
+
+void handleEstadoComporta() {
+  String json = "{\"aberta\":";
+  json += comportaAberta ? "true" : "false";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ==================================================
+// API DE DADOS ATUAIS
+// ==================================================
+
+void handleDados() {
+  String json = "{";
+
+  json += "\"nivel\":";
+  json += String(nivel, 1);
+
+  json += ",\"temperatura\":";
+  json += dhtOK ? String(temperatura, 1) : "null";
+
+  json += ",\"umidade\":";
+  json += dhtOK ? String(umidade, 1) : "null";
+
+  json += ",\"distancia\":";
+  json += ultrassonicoOK ? String(distancia, 2) : "null";
+
+  json += ",\"status\":\"";
+  json += obterStatus();
+  json += "\"";
+
+  json += ",\"sensorUltrassonico\":";
+  json += ultrassonicoOK ? "true" : "false";
+
+  json += ",\"sensorDHT\":";
+  json += dhtOK ? "true" : "false";
+
+  json += ",\"comportaAberta\":";
+  json += comportaAberta ? "true" : "false";
+
+  json += ",\"uptime\":\"";
+  json += obterUptime();
+  json += "\"}";
+
+  server.send(200, "application/json", json);
+}
+
+// ==================================================
+// API DO HISTORICO
+// ==================================================
+
+void handleHistorico() {
+  String json;
+  json.reserve(140000);
+  json = "[";
+
+  int inicio = (indiceHistorico - totalRegistros + MAX_REGISTROS)
+               % MAX_REGISTROS;
+
+  for (int i = 0; i < totalRegistros; i++) {
+    int pos = (inicio + i) % MAX_REGISTROS;
+    RegistroHistorico &r = historico[pos];
+
+    if (i > 0) json += ",";
+
+    json += "{\"tempo\":";
+    json += String(r.tempo);
+
+    json += ",\"nivel\":";
+    json += r.nivelOK ? String(r.nivel, 1) : "null";
+
+    json += ",\"temperatura\":";
+    json += r.dhtValido ? String(r.temperatura, 1) : "null";
+
+    json += ",\"umidade\":";
+    json += r.dhtValido ? String(r.umidade, 1) : "null";
+
+    json += "}";
+  }
+
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+// ==================================================
+// WIFI E MDNS
+// ==================================================
+
+void configurarWiFi() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(SSID_AP, SENHA_AP);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("    MONITORAMENTO DO SILO");
+  Serial.println("================================");
+  Serial.print("Rede Wi-Fi: ");
+  Serial.println(SSID_AP);
+  Serial.print("Senha: ");
+  Serial.println(SENHA_AP);
+  Serial.print("IP local: ");
+  Serial.println(WiFi.softAPIP());
+
+  if (MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS iniciado com sucesso.");
+    Serial.println("Endereco principal: http://silo.local");
+  } else {
+    Serial.println("Falha ao iniciar mDNS.");
+  }
+}
+
+// ==================================================
+// CONFIGURAR ROTAS DO SERVIDOR
+// ==================================================
+
+void configurarServidor() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/graficos", HTTP_GET, handleGraficos);
+  server.on("/comporta", HTTP_GET, handleComporta);
+
+  server.on("/dados", HTTP_GET, handleDados);
+  server.on("/historico", HTTP_GET, handleHistorico);
+
+  server.on("/abrir", HTTP_POST, handleAbrirComporta);
+  server.on("/fechar", HTTP_POST, handleFecharComporta);
+  server.on("/estadoComporta", HTTP_GET, handleEstadoComporta);
+
+  server.onNotFound([]() {
+    server.send(404, "text/plain; charset=utf-8",
+                "Pagina nao encontrada. Acesse http://silo.local");
+  });
+
+  server.begin();
+  Serial.println("Servidor HTTP iniciado.");
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  pinMode(ECHO_PIN, INPUT);
+
+  dht.begin();
+
+  inicializarTFT();
+
+  // Inicializar servo na posicao fechada
+  servoComporta.setPeriodHertz(50);
+  servoComporta.attach(SERVO_PIN, 500, 2400);
+  servoComporta.write(ANGULO_FECHADO);
+  comportaAberta = false;
+
+  delay(1000);
+
+  // Iniciar rede, mDNS e servidor
+  configurarWiFi();
+  configurarServidor();
+
+  // Primeiras leituras
+  atualizarUltrassonico();
+  atualizarDHT();
+  atualizarTFT();
+  registrarHistorico();
+
+  unsigned long agora = millis();
+  ultimoUltrassonico = agora;
+  ultimoDHT = agora;
+  ultimaTFT = agora;
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       SISTEMA PRONTO - TFT");
+  Serial.println("================================");
+  Serial.println("Pinos: TRIG=5 ECHO=18 DHT=15 SERVO=16");
+  Serial.println("TFT: CS14 RST21 DC47 MOSI45 SCLK3 MISO46 BL9");
+  Serial.println("TOUCH: CLK42 CS1 MOSI2 MISO41");
+  Serial.println("================================");
+  Serial.println("HOME:      http://silo.local/");
+  Serial.println("GRAFICOS:  http://silo.local/graficos");
+  Serial.println("COMPORTA:  http://silo.local/comporta");
+  Serial.println("================================");
+}
+
+// ==================================================
+// LOOP PRINCIPAL
+// ==================================================
+
+void loop() {
+  server.handleClient();
+  processarToque();
+
+  unsigned long agora = millis();
+
+  if (agora - ultimoUltrassonico >= INTERVALO_ULTRASSONICO) {
+    ultimoUltrassonico = agora;
+    atualizarUltrassonico();
+  }
+
+  if (agora - ultimoDHT >= INTERVALO_DHT) {
+    ultimoDHT = agora;
+    atualizarDHT();
+  }
+
+  if (agora - ultimaTFT >= INTERVALO_TFT) {
+    ultimaTFT = agora;
+    atualizarTFT();
+  }
+
+  registrarHistorico();
+}
