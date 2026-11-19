@@ -326,17 +326,17 @@ const bool TOUCH_INVERTER_X = false;
 const bool TOUCH_INVERTER_Y = false;
 const bool TOUCH_TROCAR_EIXOS = false;
 
-const uint16_t COR_FUNDO = 0x0841;
-const uint16_t COR_CABECALHO = 0x10A2;
-const uint16_t COR_CARTAO = 0x18E3;
-const uint16_t COR_BORDA = 0x39E7;
+const uint16_t COR_FUNDO = 0x18E3;       // grafite industrial
+const uint16_t COR_CABECALHO = 0x2124;   // painel grafite
+const uint16_t COR_CARTAO = 0x2965;       // cinza de painel
+const uint16_t COR_BORDA = 0x4A49;        // borda técnica
 const uint16_t COR_TEXTO = 0xFFFF;
 const uint16_t COR_SUAVE = 0xBDF7;
-const uint16_t COR_AZUL = 0x3D7F;
-const uint16_t COR_VERDE = 0x2E86;
-const uint16_t COR_LARANJA = 0xFD20;
-const uint16_t COR_VERMELHO = 0xF986;
-const uint16_t COR_CIANO = 0x5DFF;
+const uint16_t COR_AZUL = 0x04A0;        // azul de seleção
+const uint16_t COR_VERDE = 0x07E0;       // operação normal
+const uint16_t COR_LARANJA = 0xFFE0;     // atenção
+const uint16_t COR_VERMELHO = 0xF800;    // alarme
+const uint16_t COR_CIANO = 0x07FF;       // informação
 
 unsigned long ultimoToque = 0;
 const unsigned long DEBOUNCE_TOQUE = 250;
@@ -346,13 +346,16 @@ unsigned long ultimaAtualizacaoGrafico = 0;
 void desenharCabecalho(const char *subtitulo) {
   tft.fillScreen(COR_FUNDO);
   tft.fillRect(0, 0, 320, 36, COR_CABECALHO);
+  tft.fillRect(0, 34, 320, 2, COR_VERDE);
   tft.setTextColor(COR_TEXTO);
   tft.setTextSize(2);
   tft.setCursor(10, 10);
-  tft.print("SUPERVISORIO DO SILO");
+  tft.print("SILO  |  SUPERVISAO");
   tft.setTextSize(1);
+  tft.setTextColor(COR_CIANO);
+  tft.setCursor(11, 43);
+  tft.print("SISTEMA SCADA  /  ");
   tft.setTextColor(COR_SUAVE);
-  tft.setCursor(11, 42);
   tft.print(subtitulo);
 }
 
@@ -741,42 +744,56 @@ void handleRoot() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Silo - Home</title>
 <style>
+:root{color-scheme:dark;--bg:#171b20;--panel:#222930;--panel2:#1b2229;--line:#3b4650;--muted:#9aa7b2;--text:#edf2f5;--green:#38c879;--yellow:#f2c14e;--red:#ef5350;--cyan:#48c6d8;--blue:#3485b8}
 *{box-sizing:border-box}
-body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
-header{background:#111827;padding:16px 22px;display:flex;
-justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text);letter-spacing:.15px}
+header{background:#20272e;border-bottom:2px solid #3a4852;padding:15px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 3px 12px #0005}
+header b{font-size:16px;letter-spacing:1.1px;color:#fff}
+header div div{color:var(--cyan)!important;font-size:10px!important;letter-spacing:1.3px;margin-top:5px}
 nav{display:flex;gap:7px;flex-wrap:wrap}
-nav a{color:#cbd5e1;text-decoration:none;padding:10px;
-border:1px solid #334155;border-radius:7px;font-size:13px}
-nav a.active,nav a:hover{background:#1d4ed8;color:white}
-main{max-width:1050px;margin:auto;padding:18px}
+nav a{color:#c4cdd4;text-decoration:none;padding:10px 14px;border:1px solid #46535e;border-radius:4px;font-size:12px;font-weight:bold;letter-spacing:.5px;background:#29323a}
+nav a.active,nav a:hover{background:#245c49;border-color:var(--green);color:#fff}
+main{max-width:1120px;margin:auto;padding:20px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden}
-.ph{padding:15px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;overflow:hidden;box-shadow:0 4px 14px #0003}
+.ph{padding:14px 16px;border-bottom:1px solid var(--line);font-size:12px;font-weight:bold;letter-spacing:1px;color:#dce5eb;background:#29323a}
 .body{padding:18px}
-.silo{width:150px;height:215px;margin:8px auto 16px;
-border:3px solid #64748b;border-radius:70px 70px 18px 18px;
-position:relative;overflow:hidden;background:#0f172a}
-.material{position:absolute;bottom:0;width:100%;height:0%;
-background:linear-gradient(#f59e0b,#92400e);transition:height .5s}
-.level{text-align:center;font-size:30px;font-weight:bold}
-.status{text-align:center;padding:8px;color:#93c5fd}
+.silo{width:150px;height:215px;margin:8px auto 16px;border:3px solid #84939e;border-radius:58px 58px 12px 12px;position:relative;overflow:hidden;background:#13191e;box-shadow:inset 0 0 18px #0008}
+.material{position:absolute;bottom:0;width:100%;height:0%;background:linear-gradient(#f5d05c,#bd851e);transition:height .5s}
+.level{text-align:center;font-size:34px;font-weight:bold;color:var(--yellow);font-variant-numeric:tabular-nums}
+.status{text-align:center;padding:9px;color:var(--cyan);font-size:12px;font-weight:bold;letter-spacing:1px}
 .metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.metric{padding:14px;background:#0f172a;border:1px solid #263244;border-radius:8px}
-.label{font-size:11px;color:#94a3b8}
-.value{font-size:24px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere}
-.rows{font-size:13px;margin-top:16px}
-.rows div{padding:11px 0;border-bottom:1px solid #263244}
-.ok{color:#4ade80}.err{color:#f87171}
-footer{text-align:center;padding:20px;color:#64748b;font-size:11px}
+.metric{padding:14px;background:var(--panel2);border:1px solid #3b4852;border-radius:4px;min-width:0}
+.label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.value{font-size:24px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere;color:#f1f5f7;font-variant-numeric:tabular-nums}
+.rows{font-size:12px;margin-top:16px}
+.rows div{padding:11px 2px;border-bottom:1px solid #3a444d}
+.ok{color:var(--green)}.err{color:var(--red)}
+footer{text-align:center;padding:20px;color:#82909a;font-size:10px;letter-spacing:1px}
+.chart{padding:12px}
+canvas{display:block;width:100%;height:240px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+button{background:#303b44;color:#eaf0f3;border:1px solid #52616c;border-radius:4px;padding:10px 15px;cursor:pointer;font-weight:bold;font-size:12px;letter-spacing:.4px}
+button.active,button:hover{background:#245c49;border-color:var(--green)}
+.note{font-size:11px;color:#9aa7b2;padding:0 4px 12px}
+.content{padding:22px}
+p{font-size:13px;color:#b1bdc5;line-height:1.6}
+.gate{width:120px;height:120px;margin:24px auto;border:3px solid #788994;border-radius:8px;background:#151c22;display:flex;align-items:center;justify-content:center;font-size:48px;color:var(--cyan);box-shadow:inset 0 0 18px #0008}
+.status{padding:14px;border:1px solid #3b4852;border-radius:4px;text-align:center;font-weight:bold;background:#26343d;color:var(--cyan);margin:20px 0}
+.status.open{background:#40351e;border-color:#9a772b;color:var(--yellow)}
+button:disabled{opacity:.5;cursor:wait}
+.open{background:#246b49;color:white;border-color:#3b9b6b}.close{background:#38434c;color:white;border-color:#596771}
+#mensagem{text-align:center;min-height:20px}
+.note{font-size:11px;color:#9aa7b2}
 @media(max-width:680px){.grid{grid-template-columns:1fr}main{padding:12px}}
+@media(max-width:600px){main{padding:12px}.metrics{grid-template-columns:1fr 1fr}.value{font-size:21px}canvas{height:210px}}
 </style></head><body>
 <header>
 <div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">MONITORAMENTO EM TEMPO REAL</div></div>
 <nav>
-<a class="active" href="http://silo.local/">Home</a>
-<a href="http://silo.local/graficos">Gráficos</a>
-<a href="http://silo.local/comporta">Comporta</a>
+<a class="active" href="/">Home</a>
+<a href="/graficos">Gráficos</a>
+<a href="/comporta">Comporta</a>
 </nav>
 </header>
 <main><div class="grid">
@@ -837,33 +854,55 @@ void handleGraficos() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Silo - Gráficos</title>
 <style>
+:root{color-scheme:dark;--bg:#171b20;--panel:#222930;--panel2:#1b2229;--line:#3b4650;--muted:#9aa7b2;--text:#edf2f5;--green:#38c879;--yellow:#f2c14e;--red:#ef5350;--cyan:#48c6d8;--blue:#3485b8}
 *{box-sizing:border-box}
-body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
-header{background:#111827;padding:16px 22px;display:flex;
-justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text);letter-spacing:.15px}
+header{background:#20272e;border-bottom:2px solid #3a4852;padding:15px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 3px 12px #0005}
+header b{font-size:16px;letter-spacing:1.1px;color:#fff}
+header div div{color:var(--cyan)!important;font-size:10px!important;letter-spacing:1.3px;margin-top:5px}
 nav{display:flex;gap:7px;flex-wrap:wrap}
-nav a{color:#cbd5e1;text-decoration:none;padding:10px;
-border:1px solid #334155;border-radius:7px;font-size:13px}
-nav a.active,nav a:hover{background:#1d4ed8;color:white}
-main{max-width:1050px;margin:auto;padding:18px}
-.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden;margin-bottom:16px}
-.ph{padding:15px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+nav a{color:#c4cdd4;text-decoration:none;padding:10px 14px;border:1px solid #46535e;border-radius:4px;font-size:12px;font-weight:bold;letter-spacing:.5px;background:#29323a}
+nav a.active,nav a:hover{background:#245c49;border-color:var(--green);color:#fff}
+main{max-width:1120px;margin:auto;padding:20px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;overflow:hidden;box-shadow:0 4px 14px #0003}
+.ph{padding:14px 16px;border-bottom:1px solid var(--line);font-size:12px;font-weight:bold;letter-spacing:1px;color:#dce5eb;background:#29323a}
+.body{padding:18px}
+.silo{width:150px;height:215px;margin:8px auto 16px;border:3px solid #84939e;border-radius:58px 58px 12px 12px;position:relative;overflow:hidden;background:#13191e;box-shadow:inset 0 0 18px #0008}
+.material{position:absolute;bottom:0;width:100%;height:0%;background:linear-gradient(#f5d05c,#bd851e);transition:height .5s}
+.level{text-align:center;font-size:34px;font-weight:bold;color:var(--yellow);font-variant-numeric:tabular-nums}
+.status{text-align:center;padding:9px;color:var(--cyan);font-size:12px;font-weight:bold;letter-spacing:1px}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.metric{padding:14px;background:var(--panel2);border:1px solid #3b4852;border-radius:4px;min-width:0}
+.label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.value{font-size:24px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere;color:#f1f5f7;font-variant-numeric:tabular-nums}
+.rows{font-size:12px;margin-top:16px}
+.rows div{padding:11px 2px;border-bottom:1px solid #3a444d}
+.ok{color:var(--green)}.err{color:var(--red)}
+footer{text-align:center;padding:20px;color:#82909a;font-size:10px;letter-spacing:1px}
 .chart{padding:12px}
-canvas{display:block;width:100%;height:220px}
-.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
-.metric{background:#111827;border:1px solid #263244;border-radius:8px;padding:15px}
-.label{font-size:11px;color:#94a3b8}.value{font-size:22px;margin-top:8px;font-weight:bold}
+canvas{display:block;width:100%;height:240px}
 .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-button{background:#1f2937;color:white;border:1px solid #334155;border-radius:7px;padding:10px;cursor:pointer}
-button.active{background:#1d4ed8}
-.note{font-size:11px;color:#64748b;padding:0 4px 12px}
-@media(max-width:600px){main{padding:12px}.metrics{grid-template-columns:1fr}}
+button{background:#303b44;color:#eaf0f3;border:1px solid #52616c;border-radius:4px;padding:10px 15px;cursor:pointer;font-weight:bold;font-size:12px;letter-spacing:.4px}
+button.active,button:hover{background:#245c49;border-color:var(--green)}
+.note{font-size:11px;color:#9aa7b2;padding:0 4px 12px}
+.content{padding:22px}
+p{font-size:13px;color:#b1bdc5;line-height:1.6}
+.gate{width:120px;height:120px;margin:24px auto;border:3px solid #788994;border-radius:8px;background:#151c22;display:flex;align-items:center;justify-content:center;font-size:48px;color:var(--cyan);box-shadow:inset 0 0 18px #0008}
+.status{padding:14px;border:1px solid #3b4852;border-radius:4px;text-align:center;font-weight:bold;background:#26343d;color:var(--cyan);margin:20px 0}
+.status.open{background:#40351e;border-color:#9a772b;color:var(--yellow)}
+button:disabled{opacity:.5;cursor:wait}
+.open{background:#246b49;color:white;border-color:#3b9b6b}.close{background:#38434c;color:white;border-color:#596771}
+#mensagem{text-align:center;min-height:20px}
+.note{font-size:11px;color:#9aa7b2}
+@media(max-width:680px){.grid{grid-template-columns:1fr}main{padding:12px}}
+@media(max-width:600px){main{padding:12px}.metrics{grid-template-columns:1fr 1fr}.value{font-size:21px}canvas{height:210px}}
 </style></head><body>
 <header><div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">HISTÓRICO DO PROCESSO</div></div>
 <nav>
-<a href="http://silo.local/">Home</a>
-<a class="active" href="http://silo.local/graficos">Gráficos</a>
-<a href="http://silo.local/comporta">Comporta</a>
+<a href="/">Home</a>
+<a class="active" href="/graficos">Gráficos</a>
+<a href="/comporta">Comporta</a>
 </nav></header>
 <main>
 <div class="filters">
@@ -953,38 +992,55 @@ void handleComporta() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Silo - Comporta</title>
 <style>
+:root{color-scheme:dark;--bg:#171b20;--panel:#222930;--panel2:#1b2229;--line:#3b4650;--muted:#9aa7b2;--text:#edf2f5;--green:#38c879;--yellow:#f2c14e;--red:#ef5350;--cyan:#48c6d8;--blue:#3485b8}
 *{box-sizing:border-box}
-body{margin:0;font-family:Arial;background:#0b1120;color:#e5e7eb}
-header{background:#111827;padding:16px 22px;display:flex;
-justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text);letter-spacing:.15px}
+header{background:#20272e;border-bottom:2px solid #3a4852;padding:15px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;box-shadow:0 3px 12px #0005}
+header b{font-size:16px;letter-spacing:1.1px;color:#fff}
+header div div{color:var(--cyan)!important;font-size:10px!important;letter-spacing:1.3px;margin-top:5px}
 nav{display:flex;gap:7px;flex-wrap:wrap}
-nav a{color:#cbd5e1;text-decoration:none;padding:10px;
-border:1px solid #334155;border-radius:7px;font-size:13px}
-nav a.active,nav a:hover{background:#1d4ed8;color:white}
-main{max-width:600px;margin:auto;padding:18px}
-.panel{background:#111827;border:1px solid #263244;border-radius:12px;overflow:hidden}
-.ph{padding:16px;border-bottom:1px solid #263244;font-size:13px;font-weight:bold}
+nav a{color:#c4cdd4;text-decoration:none;padding:10px 14px;border:1px solid #46535e;border-radius:4px;font-size:12px;font-weight:bold;letter-spacing:.5px;background:#29323a}
+nav a.active,nav a:hover{background:#245c49;border-color:var(--green);color:#fff}
+main{max-width:1120px;margin:auto;padding:20px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;overflow:hidden;box-shadow:0 4px 14px #0003}
+.ph{padding:14px 16px;border-bottom:1px solid var(--line);font-size:12px;font-weight:bold;letter-spacing:1px;color:#dce5eb;background:#29323a}
+.body{padding:18px}
+.silo{width:150px;height:215px;margin:8px auto 16px;border:3px solid #84939e;border-radius:58px 58px 12px 12px;position:relative;overflow:hidden;background:#13191e;box-shadow:inset 0 0 18px #0008}
+.material{position:absolute;bottom:0;width:100%;height:0%;background:linear-gradient(#f5d05c,#bd851e);transition:height .5s}
+.level{text-align:center;font-size:34px;font-weight:bold;color:var(--yellow);font-variant-numeric:tabular-nums}
+.status{text-align:center;padding:9px;color:var(--cyan);font-size:12px;font-weight:bold;letter-spacing:1px}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.metric{padding:14px;background:var(--panel2);border:1px solid #3b4852;border-radius:4px;min-width:0}
+.label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.value{font-size:24px;font-weight:bold;margin-top:8px;overflow-wrap:anywhere;color:#f1f5f7;font-variant-numeric:tabular-nums}
+.rows{font-size:12px;margin-top:16px}
+.rows div{padding:11px 2px;border-bottom:1px solid #3a444d}
+.ok{color:var(--green)}.err{color:var(--red)}
+footer{text-align:center;padding:20px;color:#82909a;font-size:10px;letter-spacing:1px}
+.chart{padding:12px}
+canvas{display:block;width:100%;height:240px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+button{background:#303b44;color:#eaf0f3;border:1px solid #52616c;border-radius:4px;padding:10px 15px;cursor:pointer;font-weight:bold;font-size:12px;letter-spacing:.4px}
+button.active,button:hover{background:#245c49;border-color:var(--green)}
+.note{font-size:11px;color:#9aa7b2;padding:0 4px 12px}
 .content{padding:22px}
-p{font-size:13px;color:#94a3b8;line-height:1.6}
-.gate{width:120px;height:120px;margin:24px auto;border:3px solid #475569;
-border-radius:18px;background:#0f172a;display:flex;align-items:center;
-justify-content:center;font-size:48px}
-.status{padding:14px;border-radius:8px;text-align:center;font-weight:bold;
-background:#172554;color:#93c5fd;margin:20px 0}
-.status.open{background:#422006;color:#fbbf24}
-button{width:100%;padding:16px;border:0;border-radius:8px;
-font-weight:bold;font-size:14px;margin-top:10px;cursor:pointer}
-button:disabled{opacity:.5}
-.open{background:#15803d;color:white}.close{background:#334155;color:white}
+p{font-size:13px;color:#b1bdc5;line-height:1.6}
+.gate{width:120px;height:120px;margin:24px auto;border:3px solid #788994;border-radius:8px;background:#151c22;display:flex;align-items:center;justify-content:center;font-size:48px;color:var(--cyan);box-shadow:inset 0 0 18px #0008}
+.status{padding:14px;border:1px solid #3b4852;border-radius:4px;text-align:center;font-weight:bold;background:#26343d;color:var(--cyan);margin:20px 0}
+.status.open{background:#40351e;border-color:#9a772b;color:var(--yellow)}
+button:disabled{opacity:.5;cursor:wait}
+.open{background:#246b49;color:white;border-color:#3b9b6b}.close{background:#38434c;color:white;border-color:#596771}
 #mensagem{text-align:center;min-height:20px}
-.note{font-size:11px;color:#64748b}
-@media(max-width:600px){main{padding:12px}}
+.note{font-size:11px;color:#9aa7b2}
+@media(max-width:680px){.grid{grid-template-columns:1fr}main{padding:12px}}
+@media(max-width:600px){main{padding:12px}.metrics{grid-template-columns:1fr 1fr}.value{font-size:21px}canvas{height:210px}}
 </style></head><body>
 <header><div><b>SUPERVISÓRIO DO SILO</b><div style="color:#64748b;font-size:11px;margin-top:5px">CONTROLE DA COMPORTA</div></div>
 <nav>
-<a href="http://silo.local/">Home</a>
-<a href="http://silo.local/graficos">Gráficos</a>
-<a class="active" href="http://silo.local/comporta">Comporta</a>
+<a href="/">Home</a>
+<a href="/graficos">Gráficos</a>
+<a class="active" href="/comporta">Comporta</a>
 </nav></header>
 <main><section class="panel"><div class="ph">CONTROLE DA COMPORTA</div>
 <div class="content">
